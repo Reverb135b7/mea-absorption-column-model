@@ -107,8 +107,9 @@ def generate_synthetic_dataset(
         # Simple exponential filter
         C_G_CO2[i] = C_G_CO2[i-1] + (C_G_CO2[i] - C_G_CO2[i-1]) * dt / tau
 
-    # Liquid-phase CO2 concentration
-    C_L_CO2 = 50.0 + 30.0 * (1 - C_G_CO2 / 8.0)  # inverse relationship
+    # Liquid-phase loading (alpha, mol CO2 / mol MEA)  (Formulation B)
+    # alpha ranges from ~0.05 (lean) to ~0.2 (rich) in typical MEA service
+    alpha = 0.05 + 0.15 * np.clip(1.0 - C_G_CO2 / 8.0, 0, 1)
 
     # Gas temperature (flue gas)
     T_gas = BASELINE_PARAMS['T_INLET'] + 5.0 * np.sin(2 * np.pi * 0.01 * times) + \
