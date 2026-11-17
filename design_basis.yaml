@@ -1,21 +1,58 @@
-T_ambient_C: 40.0
-UA_reboiler_W_per_K: 500.0
-a_i_m2_m3: 250.0
+# Design basis for the MEA absorber/stripper reduced model.
+# Throughput is declared, not inferred from a hard-coded diameter and velocity.
+
+# --- geometry -------------------------------------------------------------
 column_diameter_m: 1.0
 column_height_m: 30.0
+a_i_m2_m3: 250.0
+
+# --- gas side (design point) ---------------------------------------------
+# 0.945 mol/s captured at 90% => 1.05 mol/s CO2 in.
+# C_G_CO2_inlet = 8 mol/m3 => Vdot_gas = 1.05 / 8 = 0.131 m3/s.
+gas_volumetric_flow_m3_s: 0.131
+C_G_CO2_inlet_mol_m3: 8.0
+inlet_CO2_fraction: 0.20
+design_capture_fraction: 0.90
+gas_temperature_inlet_C: 40.0
+gas_pressure_Pa: 101325.0
+
+# Derived: u_G = Vdot / (pi D^2/4) = 0.131 / 0.7854 = 0.167 m/s
+# (low for structured packing; kept as a flag, not hidden)
+
+# --- solvent --------------------------------------------------------------
+m_solvent_kg_s: 0.7697
+w_MEA: 0.30
+solvent_MEA_concentration_mol_m3: 4961.0
+lean_CO2_loading: 0.20
+rich_CO2_loading: 0.45
+cp_solvent_kJ_kg_K: 3.8
+hx_approach_dT_K: 10.0
+
+# --- mass-transfer basis --------------------------------------------------
+# K_G*a is calibrated from the design point via HTU/NTU, not from a geometry
+# guess:  NTU = -ln(1-capture),  HTU = H/NTU,  K_Ga = G_M/(HTU*P)
+kg_a_basis: design_point_HTU
+
+# --- stripper / reboiler --------------------------------------------------
+T_reboiler_C: 140.0
+T_ambient_C: 40.0
+# 500 W/K gave 47.5 kW (37% of duty) -- implausible. 50 W/K gives ~5 kW,
+# inside the 2-5% band for a 140 kW duty.
+UA_reboiler_W_per_K: 50.0
+stripper_T_top_C: 85.0
+stripper_P_bar: 1.5
+
+# --- targets and operating bands -----------------------------------------
+target_SRD_GJt: 3.0
+target_SRD_min_GJt: 1.5
+target_SRD_max_GJt: 5.0
+u_G_min_m_s: 1.0
+u_G_max_m_s: 2.0
+u_L_min_m_s: 0.01
+u_L_max_m_s: 0.05
+
+# --- numerics -------------------------------------------------------------
 default_n_zones: 10
 disturbance_gas_velocity_fraction: 0.2
 disturbance_inlet_temp_fraction: 0.1
 disturbance_reboiler_fraction: 0.15
-lean_CO2_loading: 0.2
-m_solvent_kg_s: 1.0
-reboiler_duty_kW_max: 224.6
-reboiler_duty_kW_min: 62.4
-solvent_MEA_concentration_mol_m3: 3000.0
-target_SRD_GJt: 3.0
-target_SRD_max_GJt: 5.0
-target_SRD_min_GJt: 1.5
-u_G_max_m_s: 2.0
-u_G_min_m_s: 1.0
-u_L_max_m_s: 0.05
-u_L_min_m_s: 0.01

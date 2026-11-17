@@ -77,6 +77,22 @@ def load_design_basis(path="design_basis.yaml"):
         return {}
 
 
+def overhead_water_mol_s(n_CO2_mol_s, T_top_C, P_strip_bar):
+    """Saturated overhead water from an explicit T/P assumption (not a state).
+
+    Antoine (water, log10 mmHg): 8.07131 - 1730.63/(233.426 + T_C).
+    Q_steam derived from this must be labelled steam_source="assumed_overhead".
+    """
+    P_sat_mmHg = 10.0 ** (8.07131 - 1730.63 / (233.426 + T_top_C))
+    P_sat_bar = P_sat_mmHg * 1.33322e-3
+    if P_sat_bar >= 0.95 * P_strip_bar:
+        raise ValueError(
+            f"stripper overhead saturated: P_sat={P_sat_bar:.3f} bar vs "
+            f"P_strip={P_strip_bar:.3f} bar at {T_top_C:.1f} C"
+        )
+    return n_CO2_mol_s * P_sat_bar / (P_strip_bar - P_sat_bar)
+
+
 # ============================================================================
 # Helper: MEA Concentration from weight percent
 # ============================================================================
@@ -472,6 +488,7 @@ def mol_column_odes(t, state, n_zones=None, params=None):
     a_i = params.get('a_i', 250.0)            # interfacial area/vol (m²/m³)
     UA = params.get('UA', 500.0)              # overall heat transfer coeff (W/m·K)
     C_MEA = params.get('C_MEA', 3000.0)       # MEA concentration (mol/m³)
+    K_Ga = params.get('K_Ga', None)  # mol/(m3 s Pa), design-calibrated
     
     # Current state vector structure: 3 values per zone
     # state = [C_G_CO2_0, alpha_0, T_gas_0, T_liquid_0, C_G_CO2_1, ...]
@@ -570,6 +587,14 @@ def mol_column_odes(t, state, n_zones=None, params=None):
             K_G=K_G_DEFAULT, K_L=K_L_DEFAULT, a_i=a_i,
             C_MEA=C_MEA, P_total=101325.0
         )
+
+        # Design-calibrated volumetric coefficient (HTU/NTU basis). The
+        # film-resistance expression above is kept for diagnostics only.
+        if K_Ga is not None:
+            P_G_node = C_G_CO2[i] * 8.314 * (T_avg + 273.15)
+            rate_vol = K_Ga * max(P_G_node - P_star, 0.0)   # mol/(m3 s)
+        else:
+            rate_vol = a_i * N_CO2
         
         # --- 2. Loading update rate (not a reaction, but mass transfer driven) ---
         # alpha changes because CO2 is transferred between gas and liquid
@@ -580,7 +605,7 @@ def mol_column_odes(t, state, n_zones=None, params=None):
             # N_CO2 is mol/m²/s, a_i is m²/m³, eps_L is dimensionless
             # so (a_i / eps_L) * N_CO2 is mol/m³/s in liquid
             # Divide by C_MEA (mol MEA/m³) to get mol CO2 / mol MEA / s = d(alpha)/dt
-            dalpha_source = (a_i / eps_L) * N_CO2 / C_MEA  # 1/s, rate of loading change
+            dalpha_source = rate_vol / (eps_L * C_MEA)  # 1/s, rate of loading change
         else:
             dalpha_source = 0.0
         
@@ -615,7 +640,7 @@ def mol_column_odes(t, state, n_zones=None, params=None):
         
         # Gas temperature change: heat loss to liquid
         # Cp_gas ≈ 1.0 kJ/kg·K but we'll use simplified
-        source_T_gas = -dQ / (RHO_G * CP_G * eps_G) if eps_G > 0 else 0.0
+        source_T_gas = dQ / (RHO_G * CP_G * eps_G) if eps_G > 0 else 0.0  # dQ>0: liquid -> gas
         
         # Liquid temperature change: heat gain from gas + reaction enthalpy
         # Desorption is endothermic (opposite sign of absorption enthalpy)
@@ -643,67 +668,62 @@ def mol_column_odes(t, state, n_zones=None, params=None):
         # desorption_term = (a_i * N_CO2 * abs(ΔH_CARBAMATE)) / (4.18 * eps_L)
         # This assumes the heat goes into the liquid phase volume element.
         
-        desorption_term = (a_i * N_CO2 * abs(ΔH_CARBAMATE) * 1000.0) / (RHO_L * CP_L * eps_L) if eps_L > 0 else 0.0
+        desorption_term = (rate_vol * abs(ΔH_CARBAMATE) * 1000.0) / (RHO_L * CP_L * eps_L) if eps_L > 0 else 0.0
         
-        source_T_liquid = dQ / (RHO_L * CP_L * eps_L) + desorption_term if eps_L > 0 else 0.0
+        source_T_liquid = (-dQ / (RHO_L * CP_L * eps_L) + desorption_term) if eps_L > 0 else 0.0
         
-        # --- 5. Convection terms (upwind differencing) ---
-        
-        if N == 1:
-            # Single zone: no convection (no spatial variation)
+        # --- 5. Convection (first-order upwind, flow directions respected) ---
+        # Gas rises (+z) so it takes information from i-1; liquid falls (-z)
+        # so it takes information from i+1. The old central differences with a
+        # single sign let rich loading accumulate at the bottom without outflow,
+        # driving alpha past saturation.
+        if i == 0:
+            # gas inlet (Dirichlet): held at the inlet condition
             conv_G = 0.0
-            conv_alpha = 0.0
             conv_T_gas = 0.0
-            conv_T_liquid = 0.0
-        elif i == 0:
-            # INLET node (z=0): boundary condition applied
-            if u_G > 0:  # gas flows upward (positive z direction)
-                conv_G = (C_G_CO2[i+1] - C_G_CO2[i]) / dz if i+1 < N else 0.0
-                conv_alpha = 0.0  # at bottom, no alpha gradient info
-                conv_T_gas = (T_gas[i+1] - T_gas[i]) / dz if i+1 < N else 0.0
-                conv_T_liquid = 0.0  # at bottom, liquid at inlet condition
-            else:
-                conv_G = 0.0
-                conv_alpha = 0.0
-                conv_T_gas = 0.0
-                conv_T_liquid = 0.0
-        elif i == N - 1:
-            # OUTLET node (z=COLUMN_HEIGHT): backward difference
-            conv_G = (C_G_CO2[i] - C_G_CO2[i-1]) / dz
-            conv_alpha = (alpha[i] - alpha[i-1]) / dz
-            conv_T_gas = (T_gas[i] - T_gas[i-1]) / dz
-            conv_T_liquid = (T_liquid[i] - T_liquid[i-1]) / dz
+            gas_inlet = True
         else:
-            # Interior node: central differencing for convection
-            conv_G = (C_G_CO2[i+1] - C_G_CO2[i-1]) / (2.0 * dz)
-            conv_alpha = (alpha[i+1] - alpha[i-1]) / (2.0 * dz)
-            conv_T_gas = (T_gas[i+1] - T_gas[i-1]) / (2.0 * dz)
-            conv_T_liquid = (T_liquid[i+1] - T_liquid[i-1]) / (2.0 * dz)
-        
+            conv_G = (C_G_CO2[i] - C_G_CO2[i - 1]) / dz
+            conv_T_gas = (T_gas[i] - T_gas[i - 1]) / dz
+            gas_inlet = False
+
+        if i == N - 1:
+            # liquid inlet at the top (Dirichlet): held at lean solvent
+            conv_alpha = 0.0
+            conv_T_liquid = 0.0
+            liquid_inlet = True
+        else:
+            conv_alpha = (alpha[i] - alpha[i + 1]) / dz
+            conv_T_liquid = (T_liquid[i] - T_liquid[i + 1]) / dz
+            liquid_inlet = False
+
+
         # --- 6. Compute final derivatives ---
         
         # Gas phase CO2: convection + mass transfer source
         # Source: - (a_i / eps_G) * N_CO2  (mol/m³/s from gas perspective, leaving gas)
-        source_G = - (a_i / eps_G) * N_CO2 if eps_G > 0 else 0.0
+        source_G = -rate_vol / eps_G if eps_G > 0 else 0.0
         
         # Liquid phase loading: convection + mass transfer source
         # No reaction dterm in differential state (stiffness removal)
         source_alpha = dalpha_source  # from mass transfer only
         
-        # Gas temperature: convection + interphase heat transfer
-        dT_gas_dt_i = -u_G * conv_G + source_T_gas
-        
-        # Liquid temperature: convection + interphase heat transfer + desorption
-        dT_liquid_dt_i = -u_L * conv_T_liquid + source_T_liquid
-        
-        # Store derivatives
-        dC_G_CO2_dt[i] = -u_G * conv_G + source_G
-        dalpha_dt[i] = -u_L * conv_alpha + source_alpha
-        dT_gas_dt[i] = dT_gas_dt_i
-        dT_liquid_dt[i] = dT_liquid_dt_i
+        # Inlet nodes are Dirichlet: the state there is the boundary value.
+        dC_G_CO2_dt[i] = 0.0 if gas_inlet else (-u_G * conv_G + source_G)
+        dT_gas_dt[i] = 0.0 if gas_inlet else (-u_G * conv_T_gas + source_T_gas)
+        dalpha_dt[i] = 0.0 if liquid_inlet else (u_L * conv_alpha + source_alpha)
+        dT_liquid_dt[i] = 0.0 if liquid_inlet else (
+            u_L * conv_T_liquid + source_T_liquid)
     
     # Return concatenated derivatives (same order as state vector)
-    deriv = np.concatenate([dC_G_CO2_dt, dalpha_dt, dT_gas_dt, dT_liquid_dt])
+    # MUST match the state layout [C_G, alpha, T_gas, T_liquid] per node.
+    # np.concatenate([...]) produced a block-ordered vector (all C_G, then all
+    # alpha, ...), so every derivative was applied to the wrong variable.
+    deriv = np.empty(4 * N, dtype=float)
+    deriv[0::4] = dC_G_CO2_dt
+    deriv[1::4] = dalpha_dt
+    deriv[2::4] = dT_gas_dt
+    deriv[3::4] = dT_liquid_dt
     if not np.all(np.isfinite(deriv)):
         bad = np.where(~np.isfinite(deriv))[0]
         raise ValueError(
@@ -719,52 +739,32 @@ def mol_column_odes(t, state, n_zones=None, params=None):
 # ============================================================================
 
 def set_initial_conditions(n_zones=N_ZONES,
-                          C_G_CO2_inlet=8.0,     # mol/m³ CO2 in flue gas at z=0
-                          alpha_inlet=0.05,      # mol CO2 / mol MEA in lean solvent at z=COLUMN_HEIGHT
-                          # (typical 30wt% MEA with lean loading 0.05–0.15)
-                          T_gas_inlet=T_INLET,   # °C - flue gas at z=0
-                          T_liquid_inlet=40.0,   # °C - lean solvent at z=COLUMN_HEIGHT
-                          C_MEA_rich=3000.0,     # mol/m³ MEA in rich solvent (~30 wt%)
-                          **params  # additional params for ODE system
+                          C_G_CO2_inlet=8.0,
+                          alpha_inlet=0.05,
+                          T_gas_inlet=T_INLET,
+                          T_liquid_inlet=40.0,
+                          C_MEA_rich=3000.0,
+                          alpha_lean=0.20,
+                          alpha_rich=0.45,
+                          **params
                          ):
-    """Create initial state vector for MOL column simulation.
-    
-    State vector layout: [C_G_CO2_0, alpha_0, T_gas_0, T_liquid_0, C_G_CO2_1, ...]
-    Variable 2 is alpha (loading), NOT C_L_CO2 (total concentration).
+    """Initial state: flat gas profile, loading spanning rich -> lean.
+
+    No capture is pre-seeded. The old 1 - 0.3*progress profile made the
+    outlet start at exactly 30 % removal, which is what disguised a failed
+    integration as a result.
     """
     N = n_zones
     state = []
-    
-    # Spatial grid: z from 0 (bottom/inlet) to COLUMN_HEIGHT (top/exit)
-    # Gas enters at z=0, liquid enters at z=COLUMN_HEIGHT (counter-current)
-    
-    dz = COLUMN_HEIGHT / (N - 1) if N > 1 else COLUMN_HEIGHT
-    
     for i in range(N):
-        # Gas phase inlet condition: at z=0, specified C_G_CO2_inlet
-        if i == 0:
-            C_G_CO2 = C_G_CO2_inlet  # flue gas inlet concentration
-            T_gas = T_gas_inlet
-        else:
-            # Interpolate from inlet toward outlet (typical profile decay)
-            progress = i / (N - 1) if N > 1 else 1.0
-            C_G_CO2 = C_G_CO2_inlet * (1.0 - 0.3 * progress)  # decay toward outlet
-            T_gas = T_gas_inlet + 5.0 * progress  # gas heats up toward top
-        
-        # Liquid phase inlet condition: at z=COLUMN_HEIGHT (i=N-1), lean solvent
-        if i == N - 1:
-            alpha = alpha_inlet  # lean solvent loading at bottom (mol CO2 / mol MEA)
-            T_liquid = T_liquid_inlet
-        else:
-            # Interpolate from outlet toward inlet
-            progress = i / (N - 1) if N > 1 else 1.0
-            # Liquid gains CO2 as it flows down, so alpha increases toward bottom
-            alpha = alpha_inlet * (1.0 + 0.5 * progress)  # increase toward bottom
-            T_liquid = T_liquid_inlet + 10.0 * progress  # liquid heats toward bottom (reboiler)
-        
+        frac = i / (N - 1) if N > 1 else 1.0
+        C_G_CO2 = C_G_CO2_inlet                      # flat: no seeded removal
+        alpha = alpha_rich + (alpha_lean - alpha_rich) * frac  # rich bottom
+        T_gas = T_gas_inlet + 5.0 * frac
+        T_liquid = T_liquid_inlet + 10.0 * frac
         state.extend([C_G_CO2, alpha, T_gas, T_liquid])
-    
     return np.array(state, dtype=float)
+
 
 
 def set_boundary_conditions(params):
@@ -807,6 +807,8 @@ def simulate_column_mol(
     - Stiffness removed: no free dissolved CO2 differential state
     - Enhancement factor closed algebraically
     """
+    global COLUMN_DIAMETER, COLUMN_HEIGHT
+
     if duration <= 0:
         raise ValueError(f"duration must be > 0 s (got {duration})")
 
@@ -829,12 +831,57 @@ def simulate_column_mol(
         'm_solvent': params.get('m_solvent', None),
     }
 
-    # Reboiler UA and ambient temperature from the design basis. Reported,
-    # never silently replaced with the docstring value.
+    # ---- design basis: declared throughput, derived velocity ----------------
     db = load_design_basis()
+    cfg = {
+        'D': float(db.get('column_diameter_m', COLUMN_DIAMETER)),
+        'H': float(db.get('column_height_m', COLUMN_HEIGHT)),
+        'a_i': float(db.get('a_i_m2_m3', 250.0)),
+        'Vdot_gas': float(db.get('gas_volumetric_flow_m3_s', 0.131)),
+        'C_G_in': float(db.get('C_G_CO2_inlet_mol_m3', 8.0)),
+        'capture_target': float(db.get('design_capture_fraction', 0.90)),
+        'P': float(db.get('gas_pressure_Pa', 101325.0)),
+        'T_gas_in': float(db.get('gas_temperature_inlet_C', 40.0)),
+        'm_solvent': float(db.get('m_solvent_kg_s', 0.7697)),
+        'w_MEA': float(db.get('w_MEA', 0.30)),
+        'C_MEA': float(db.get('solvent_MEA_concentration_mol_m3', 4961.0)),
+        'alpha_lean': float(db.get('lean_CO2_loading', 0.20)),
+        'alpha_rich': float(db.get('rich_CO2_loading', 0.45)),
+        'cp_L': float(db.get('cp_solvent_kJ_kg_K', 3.8)),
+        'dT_HX': float(db.get('hx_approach_dT_K', 10.0)),
+        'T_reb': float(db.get('T_reboiler_C', 140.0)),
+        'T_amb': float(db.get('T_ambient_C', 40.0)),
+        'UA': float(params.get('UA_reboiler', db.get('UA_reboiler_W_per_K', 50.0))),
+        'T_top': float(db.get('stripper_T_top_C', 85.0)),
+        'P_strip': float(db.get('stripper_P_bar', 1.5)),
+    }
+
+    # Geometry used by the RHS and the removal integral
+    COLUMN_DIAMETER, COLUMN_HEIGHT = cfg['D'], cfg['H']
+
+    A_cs = np.pi * (cfg['D'] / 2.0) ** 2
+    u_G = cfg['Vdot_gas'] / A_cs                       # derived, not declared
+    C_total = cfg['P'] / (8.314 * (cfg['T_gas_in'] + 273.15))
+    G_M = u_G * C_total                                # mol/(m2 s)
+    NTU = -np.log(max(1.0 - cfg['capture_target'], 1e-6))
+    HTU = cfg['H'] / NTU
+    K_Ga = G_M / (HTU * cfg['P'])                      # mol/(m3 s Pa)
+
+    default_params.update({
+        'u_G': u_G,
+        'a_i': cfg['a_i'],
+        'C_MEA': cfg['C_MEA'],
+        'm_solvent': cfg['m_solvent'],
+        'alpha_lean': cfg['alpha_lean'],
+        'alpha_rich': cfg['alpha_rich'],
+        'K_Ga': K_Ga,
+        'T_gas_inlet': cfg['T_gas_in'],
+        'C_G_CO2_inlet': cfg['C_G_in'],
+    })
+
+    UA_reboiler, T_ambient = cfg['UA'], cfg['T_amb']
     UA_source = 'design_basis.yaml' if 'UA_reboiler_W_per_K' in db else 'fallback_default'
-    UA_reboiler = float(params.get('UA_reboiler', db.get('UA_reboiler_W_per_K', 50.0)))
-    T_ambient = float(params.get('T_ambient', db.get('T_ambient_C', 40.0)))
+    m_solvent = cfg['m_solvent']
     
     # Apply disturbance
     t_disturbance = 60.0  # seconds into simulation (after startup)
@@ -928,34 +975,50 @@ def simulate_column_mol(
     C_G_inlet_profile = default_params.get('C_G_CO2_inlet', 8.0)
     results['co2_removal_mol_s'] = G_flow * (C_G_inlet_profile - results['C_G_CO2'][:, -1])
     
-    # --- Reboiler energy duty ------------------------------------------------
-    m_solvent = default_params.get('m_solvent', None)
-    T_liquid_reb = results['T_liquid'][:, 0]      # liquid T at reboiler node
-    alpha_reb = results['alpha'][:, 0]            # loading at reboiler node
-    alpha_rich = float(np.mean(alpha_reb))
-    alpha_lean = float(np.mean(results['alpha'][:, -1]))
+    T_liquid_reb = results['T_liquid'][:, 0]
+    alpha_reb = results['alpha'][:, 0]
 
-    Cp = 4.18  # kJ/kg/K, aqueous MEA (placeholder)
+    # --- Steady-state window -------------------------------------------------
+    n_pts = len(times)
+    w0 = int(0.8 * n_pts) if n_pts >= 5 else 0
 
-    if m_solvent is None:
-        Q_sensible = 0.0
-        Q_sens_source = "unconfigured:m_solvent=None"
-    else:
-        # HX approach placeholder: feed -> reboiler inlet (module design temps).
-        Q_sensible = m_solvent * Cp * (T_REBOILER_OUT - T_REBOILER_IN)
-        Q_sens_source = "hx_approach_placeholder"
+    # CO2 removal from the zone flux integral (not an inlet/outlet guess).
+    dz_node = COLUMN_HEIGHT / (N - 1) if N > 1 else COLUMN_HEIGHT
+    A_cs_col = np.pi * (COLUMN_DIAMETER / 2.0) ** 2
+    n_CO2_series = np.zeros(n_pts)
+    for k in range(n_pts):
+        acc = 0.0
+        for i in range(N):
+            T_avg = 0.5 * (results['T_gas'][k, i] + results['T_liquid'][k, i])
+            P_G = results['C_G_CO2'][k, i] * 8.314 * (T_avg + 273.15)
+            P_star = equilibrium_liquid_co2_loading(results['alpha'][k, i], T_avg)
+            acc += K_Ga * max(P_G - P_star, 0.0) * A_cs_col * dz_node
+        n_CO2_series[k] = acc
 
-    # ONE time aggregate for both duty and flow (was max() here, mean() there).
-    n_CO2_avg = max(float(np.mean(results['co2_removal_mol_s'])), 0.0)
-    Q_desorption = abs(ΔH_CARBAMATE) * n_CO2_avg   # kJ/s = kW
+    n_CO2_avg = float(np.mean(n_CO2_series[w0:]))
+    n_CO2_gas_side = float(np.mean(
+        u_G * A_cs_col * (cfg['C_G_in'] - results['C_G_CO2'][w0:, -1])))
 
-    # Stripping steam: a CONSTANT, not coupled to overhead water.
-    Q_steam = N_H2O_OVERHEAD_ASSUMED * DH_VAP_H2O_KJ_MOL
+    if n_CO2_avg <= 0:
+        raise ValueError(
+            "zone flux integral reports zero CO2 removal "
+            f"(gas-side check {n_CO2_gas_side:.4g} mol/s)"
+        )
+
+    # --- duty terms ----------------------------------------------------------
+    Q_sensible = cfg['m_solvent'] * cfg['cp_L'] * cfg['dT_HX']
+    Q_sens_source = 'hx_approach_placeholder'
+
+    Q_desorption = abs(ΔH_CARBAMATE) * n_CO2_avg
+
+    n_H2O_overhead = overhead_water_mol_s(n_CO2_avg, cfg['T_top'], cfg['P_strip'])
+    Q_steam = n_H2O_overhead * DH_VAP_H2O_KJ_MOL
     steam_source = (
-        f"constant:n_H2O_overhead={N_H2O_OVERHEAD_ASSUMED} mol/s (uncoupled)"
+        f"assumed_overhead:T_top={cfg['T_top']:.0f}C,P={cfg['P_strip']:.2f}bar"
     )
 
-    Q_loss = UA_reboiler * max(float(np.max(T_liquid_reb)) - T_ambient, 1.0) / 1000.0
+    # Heat loss belongs to the reboiler/stripper, not the absorber bottom.
+    Q_loss = UA_reboiler * max(cfg['T_reb'] - cfg['T_amb'], 1.0) / 1000.0
     Q_reb = Q_sensible + Q_desorption + Q_steam + Q_loss
 
     m_CO2 = n_CO2_avg * CO2_MOLAR_MASS
@@ -967,7 +1030,7 @@ def simulate_column_mol(
 
     srd_GJt = Q_reb / m_CO2 / 1e3
     srd_kwh_kg = srd_GJt / 3.6
-    capture_pct = float(np.mean(results['capture_efficiency']))
+    capture_pct = float(np.mean(results['capture_efficiency'][w0:]))
 
     perf = ColumnPerformance(
         Q_sens=Q_sensible,
@@ -982,12 +1045,31 @@ def simulate_column_mol(
         capture_efficiency_pct=capture_pct,
         steam_source=steam_source,
         Q_sens_source=Q_sens_source,
-        T_liquid_reb=float(np.mean(T_liquid_reb)),
-        m_solvent=m_solvent,
-        alpha_rich=alpha_rich,
-        alpha_lean=alpha_lean,
+        T_liquid_reb=cfg['T_reb'],
+        m_solvent=cfg['m_solvent'],
+        alpha_rich=float(np.mean(results['alpha'][w0:, 0])),
+        alpha_lean=float(np.mean(results['alpha'][w0:, -1])),
         UA_reboiler_W_K=UA_reboiler,
+        w_MEA=cfg['w_MEA'],
+        capture_target_pct=cfg['capture_target'] * 100.0,
     )
+
+    f0 = np.asarray(mol_column_odes(0.0, y0, N, default_params), dtype=float)
+    results['gate'] = {
+        'f0_inf': float(np.max(np.abs(f0))),
+        'max_dy': float(np.max(np.abs(np.asarray(sol.y)[:, -1] - y0))),
+        'removal_source': 'zone_flux_integral',
+        'n_CO2_gas_side': n_CO2_gas_side,
+        'K_Ga': K_Ga,
+        'HTU_m': HTU,
+        'NTU': NTU,
+        'D_m': cfg['D'],
+        'A_cs_m2': A_cs_col,
+        'Vdot_gas_m3_s': cfg['Vdot_gas'],
+        'u_G_m_s': u_G,
+        'u_G_plausible': bool(1.0 <= u_G <= 2.0),
+        'n_CO2_in_mol_s': u_G * A_cs_col * cfg['C_G_in'],
+    }
 
     results['reboiler_duty'] = {
         'total_duty_kw': Q_reb,
@@ -1003,6 +1085,7 @@ def simulate_column_mol(
     results['specific_energy_kwh_kg'] = srd_kwh_kg
     results['capture_efficiency_pct'] = capture_pct
     results['ua_source'] = UA_source
+    results['steam_source'] = steam_source
     results['performance'] = perf
 
     return times, results
@@ -1099,7 +1182,6 @@ if __name__ == "__main__":
         disturbance='gas_velocity',
         disturbance_magnitude=0.2,
         n_zones=10,
-        u_G=1.5,
         u_L=0.02,
     )
     p = results['performance']

@@ -110,6 +110,8 @@ class ColumnPerformance:
     UA_reboiler_W_K: float | None = None
     #: MEA mass fraction used for loading-swing closure
     w_MEA: float = W_MEA_DEFAULT
+    #: Design capture target, %
+    capture_target_pct: float = 90.0
 
     # Class-level constants
     _DH_ABS: ClassVar[float] = DH_ABS
@@ -197,6 +199,10 @@ class ColumnPerformance:
             "capture_efficiency_pct": self.capture_efficiency_pct,
             "capture_efficiency_plausible": bool(
                 0.0 < self.capture_efficiency_pct <= 100.0
+            ),
+            "capture_target_pct": self.capture_target_pct,
+            "capture_target_met": bool(
+                abs(self.capture_efficiency_pct - self.capture_target_pct) <= 2.0
             ),
             "loss_fraction_of_duty": loss_fraction,
             "ua_reboiler_plausible": bool(
