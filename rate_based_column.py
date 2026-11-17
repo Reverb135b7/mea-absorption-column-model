@@ -23,7 +23,7 @@ from performance import ColumnPerformance, from_simulation_result
 # ============================================================================
 
 # MEA properties
-MEA_MOLAR_MASS = 0.1191  # kg/mol
+MEA_MOLAR_MASS = 0.06108  # kg/mol MEA (C2H7NO)
 CO2_MOLAR_MASS = 0.04401  # kg/mol
 WATER_MOLAR_MASS = 0.018015  # kg/mol
 
@@ -32,8 +32,15 @@ WATER_MOLAR_MASS = 0.018015  # kg/mol
 ΔH_BICARBONATE = -15.0  # CO2 + H2O + MEA ⇌ MEA-HCO3- (bicarbonate formation)
 
 # Mass transfer coefficients (typical values, can be tuned)
-K_G_DEFAULT = 0.02  # gas-side mass transfer coeff (mol/m²·s·Pa)
-K_L_DEFAULT = 0.005  # liquid-side mass transfer coeff (mol/m²·s)
+K_C_GAS_DEFAULT = 0.02  # m/s, gas-film mass-transfer velocity
+K_G_DEFAULT = K_C_GAS_DEFAULT / (8.314 * 313.15)  # mol/(m2 s Pa); RT conversion
+K_L_DEFAULT = 0.005  # liquid-side mass transfer coeff (m/s)
+
+# Heat-capacity densities: dT/dt = Q_dot[m3] / (rho * cp * holdup)
+RHO_L = 1000.0   # kg/m3
+CP_L = 4186.0    # J/kg/K
+RHO_G = 1.2      # kg/m3
+CP_G = 1050.0    # J/kg/K
 
 # Column geometry
 COLUMN_DIAMETER = 2.0  # m
@@ -80,7 +87,7 @@ def mea_concentration_from_wt(w_MEA=0.30, rho_sol=1010.0):
     For 30 wt% MEA: C_MEA ≈ 4961 mol/m³
     For 18 wt% MEA: C_MEA ≈ 3000 mol/m³ (your previous default)
     """
-    MEA_MOLAR_MASS = 0.1191  # kg/mol
+    MEA_MOLAR_MASS = 0.06108  # kg/mol MEA
     water_molar_mass = 0.018015  # kg/mol
     # mass basis: 1 m³ solution = rho_sol kg
     # MEA mass = w_MEA * rho_sol; water mass = (1-w_MEA) * rho_sol
@@ -137,8 +144,12 @@ def equilibrium_liquid_co2_loading(alpha, T, P_total=101325.0):
     # P_star ≈ H * alpha / (1 - alpha/alpha_max) with alpha_max ≈ 0.5
     alpha_max = 0.5  # mol CO2 / mol MEA maximum
     if alpha >= alpha_max:
-        alpha = alpha_max - 1e-10
-    # Enhancement factor approach: P_star = H * alpha / (1 - alpha/alpha_max)
+        raise ValueError(
+            f"liquid loading alpha={alpha:.6f} reached saturation "
+            f"(alpha_max={alpha_max}); VLE is divergent and the ODE has left "
+            "its physical domain"
+        )
+    # Equilibrium partial pressure from loading
     # This captures that richer solvent holds more CO2 at partial pressure
     P_star = H * alpha / (1.0 - alpha / alpha_max)
     return P_star
@@ -345,7 +356,10 @@ def two_film_mass_transfer_with_enhancement(C_G, alpha, T, K_G=K_G_DEFAULT,
     # P_star = H * alpha / (1 - alpha/alpha_max)
     alpha_max = 0.5  # mol CO2 / mol MEA max
     if alpha >= alpha_max:
-        alpha = alpha_max - 1e-10
+        raise ValueError(
+            f"liquid loading alpha={alpha:.6f} reached saturation "
+            f"(alpha_max={alpha_max}) at T={T:.1f} C"
+        )
     H = henry_constant_Pa_m3_mol(T)
     P_star = H * alpha / (1.0 - alpha / alpha_max)
     
@@ -601,7 +615,7 @@ def mol_column_odes(t, state, n_zones=None, params=None):
         
         # Gas temperature change: heat loss to liquid
         # Cp_gas ≈ 1.0 kJ/kg·K but we'll use simplified
-        source_T_gas = -dQ / (1.0 * eps_G) if eps_G > 0 else 0.0  # simplified
+        source_T_gas = -dQ / (RHO_G * CP_G * eps_G) if eps_G > 0 else 0.0
         
         # Liquid temperature change: heat gain from gas + reaction enthalpy
         # Desorption is endothermic (opposite sign of absorption enthalpy)
@@ -629,9 +643,9 @@ def mol_column_odes(t, state, n_zones=None, params=None):
         # desorption_term = (a_i * N_CO2 * abs(ΔH_CARBAMATE)) / (4.18 * eps_L)
         # This assumes the heat goes into the liquid phase volume element.
         
-        desorption_term = (a_i * N_CO2 * abs(ΔH_CARBAMATE)) / (4.18 * eps_L) if eps_L > 0 else 0.0
+        desorption_term = (a_i * N_CO2 * abs(ΔH_CARBAMATE) * 1000.0) / (RHO_L * CP_L * eps_L) if eps_L > 0 else 0.0
         
-        source_T_liquid = dQ / (4.18 * eps_L) + desorption_term if eps_L > 0 else 0.0
+        source_T_liquid = dQ / (RHO_L * CP_L * eps_L) + desorption_term if eps_L > 0 else 0.0
         
         # --- 5. Convection terms (upwind differencing) ---
         
@@ -689,9 +703,15 @@ def mol_column_odes(t, state, n_zones=None, params=None):
         dT_liquid_dt[i] = dT_liquid_dt_i
     
     # Return concatenated derivatives (same order as state vector)
-    return [
-        *dC_G_CO2_dt, *dalpha_dt, *dT_gas_dt, *dT_liquid_dt
-    ]
+    deriv = np.concatenate([dC_G_CO2_dt, dalpha_dt, dT_gas_dt, dT_liquid_dt])
+    if not np.all(np.isfinite(deriv)):
+        bad = np.where(~np.isfinite(deriv))[0]
+        raise ValueError(
+            f"non-finite RHS at t={t:.6g}s, indices {bad[:8].tolist()} "
+            f"(C_G max={np.nanmax(C_G_CO2):.4g}, alpha max={np.nanmax(alpha):.4g}, "
+            f"T_liq max={np.nanmax(T_liquid):.4g})"
+        )
+    return deriv
 
 
 # ============================================================================
@@ -854,13 +874,28 @@ def simulate_column_mol(
         ode_system,
         [0, duration],
         y0,
-        method='RK45',
+        method='LSODA',
         t_eval=times,
-        rtol=1e-4,
-        atol=1e-6,
-        max_step=dt
+        rtol=1e-6,
+        atol=1e-9,
+        max_step=dt,
     )
-    
+
+    # A failed integration must not masquerade as a completed run. Without this
+    # check solve_ivp returns the untouched initial state on failure -- which is
+    # how a 30 %-capture placeholder read as a result.
+    if sol.status != 0:
+        reached = sol.t[-1] if len(sol.t) else float('nan')
+        raise RuntimeError(
+            f"solve_ivp failed (status={sol.status}): {sol.message} "
+            f"(reached t={reached} of {duration} s)"
+        )
+    if len(sol.t) < 2:
+        raise RuntimeError(
+            f"solver returned {len(sol.t)} time point(s); no trajectory to report"
+        )
+
+
     # Organize results
     results = {
         'times': sol.t,

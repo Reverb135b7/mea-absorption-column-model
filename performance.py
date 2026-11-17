@@ -37,7 +37,7 @@ from typing import ClassVar
 
 M_CO2: float = 0.04401      # kg / mol CO2
 M_WATER: float = 0.018015   # kg / mol H2O
-MEA_MOLAR_MASS: float = 0.1191  # kg / mol MEA
+MEA_MOLAR_MASS: float = 0.06108  # kg / mol MEA (C2H7NO)
 
 # Reaction enthalpies (kJ / mol per CO2)
 DH_ABS: float = 85.0        # carbamate formation; desorption needs +85 kJ/mol
