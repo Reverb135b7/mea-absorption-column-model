@@ -715,14 +715,19 @@ def mol_column_odes(t, state, n_zones=None, params=None):
         # source must be converted with eps_G (the old code divided only the
         # source, which made the gas balance and the removal integral differ by
         # exactly 1/eps_G and could never close).
-        source_G = -rate_vol / eps_G if eps_G > 0 else 0.0
+        # C_G is per unit GAS volume, so the whole balance (transport and sink)
+        # is divided by eps_G. Dividing only the sink left the removal integral
+        # (per column volume) low by exactly eps_G.
+        source_G = -rate_vol
         
         # Liquid phase loading: convection + mass transfer source
         # No reaction dterm in differential state (stiffness removal)
         source_alpha = dalpha_source  # from mass transfer only
         
         # Inlet nodes are Dirichlet: the state there is the boundary value.
-        dC_G_CO2_dt[i] = 0.0 if gas_inlet else (-u_G * conv_G + source_G)
+        dC_G_CO2_dt[i] = 0.0 if gas_inlet else (
+            (-u_G * conv_G + source_G) / eps_G if eps_G > 0
+            else (-u_G * conv_G + source_G))
         dT_gas_dt[i] = 0.0 if gas_inlet else (-u_G * conv_T_gas + source_T_gas)
         dalpha_dt[i] = 0.0 if liquid_inlet else (u_L * conv_alpha + source_alpha)
         dT_liquid_dt[i] = 0.0 if liquid_inlet else (
@@ -883,7 +888,12 @@ def simulate_column_mol(
     # Liquid velocity from the declared solvent mass flow, not a demo number:
     # u_L = m / (rho_L * eps_L * A). With 0.7697 kg/s, 0.15 holdup and A=0.785
     # this is 5.9 mm/s, i.e. a 5100 s liquid residence time in a 30 m column.
-    u_L_derived = cfg['m_solvent'] / (RHO_L * cfg['eps_L'] * A_cs)
+    # Derived from the MEA molar flow and the declared C_MEA, NOT from RHO_L:
+    # C_MEA = 4961 mol/m3 implies rho ~ 1010 kg/m3 (30 wt%), while RHO_L = 1100,
+    # so a density-based u_L made the liquid carry 3.3 % less CO2 than the gas
+    # gave up and the loading-swing closure could never pass.
+    u_L_derived = (cfg['m_solvent'] * cfg['w_MEA'] / MEA_MOLAR_MASS
+                   / (cfg['eps_L'] * A_cs * cfg['C_MEA']))
     u_L = float(params.get('u_L_override', u_L_derived))
     C_total = cfg['P'] / (8.314 * (cfg['T_gas_in'] + 273.15))
     G_M = u_G * C_total                                # mol/(m2 s)
@@ -892,8 +902,10 @@ def simulate_column_mol(
     # The old K_Ga = G_M/(HTU*P) with HTU = H/NTU was circular: it was derived
     # from H, so it could not be used to judge whether H was right, and it
     # reported 69 % for the same design point it was calibrated on.
-    K_Ga = float(params.get('K_Ga_override',
-                            db.get('K_Ga_mol_m3_s_Pa', K_G_DEFAULT * cfg['a_i'])))
+    K_Ga = params.get('K_Ga_override')
+    if K_Ga is None:                      # no override: use the design basis
+        K_Ga = db.get('K_Ga_mol_m3_s_Pa', K_G_DEFAULT * cfg['a_i'])
+    K_Ga = float(K_Ga)
     kg_a_basis = str(db.get('kg_a_basis', 'gas_film:K_G(7.68e-6) x a_i'))
     NTU = K_Ga * cfg['P'] * cfg['H'] / G_M             # available, diagnostic
     HTU = cfg['H'] / NTU if NTU > 0 else float('inf')
@@ -906,7 +918,6 @@ def simulate_column_mol(
         'alpha_lean': cfg['alpha_lean'],
         'alpha_rich': cfg['alpha_rich'],
         'K_Ga': K_Ga,
-        'K_Ga_used_in_rhs': float(default_params.get('K_Ga', float('nan'))),
         'kg_a_basis': kg_a_basis,
         'u_L': u_L,
         'T_gas_inlet': cfg['T_gas_in'],
@@ -1038,8 +1049,15 @@ def simulate_column_mol(
         n_CO2_series[k] = acc
 
     n_CO2_avg = float(np.mean(n_CO2_series[w0:]))
+    # The velocity the RHS actually ran with: a gas_velocity disturbance scales
+    # u_G after t_disturbance. Reporting the base velocity here (while the
+    # solver used base*(1+magnitude)) biased the gas-side removal by exactly
+    # that factor -- the unexplained 20 % / 2 % residual.
+    u_G_applied = u_G
+    if disturbance == 'gas_velocity' and duration >= t_disturbance:
+        u_G_applied = u_G * (1.0 + disturbance_magnitude)
     n_CO2_gas_side = float(np.mean(
-        u_G * A_cs_col * (cfg['C_G_in'] - results['C_G_CO2'][w0:, -1])))
+        u_G_applied * A_cs_col * (cfg['C_G_in'] - results['C_G_CO2'][w0:, -1])))
 
     if n_CO2_avg <= 0:
         raise ValueError(
@@ -1120,7 +1138,8 @@ def simulate_column_mol(
         'A_cs_m2': A_cs_col,
         'Vdot_gas_m3_s': cfg['Vdot_gas'],
         'u_G_m_s': u_G,
-        'u_G_in_rhs': float(default_params.get('u_G', float('nan'))),
+        'u_G_applied': float(u_G_applied),
+        'disturbance': str(disturbance),
         'eps_G_in_rhs': float(default_params.get('eps_G', float('nan'))),
         'eps_L_in_rhs': float(default_params.get('eps_L', float('nan'))),
         'u_G_plausible': bool(1.0 <= u_G <= 2.0),
@@ -1201,8 +1220,8 @@ def calculate_column_performance_mol(simulation_result,
 
 
 def simulate_column_step_response(duration=300, dt=1.0,
-                                 disturbance='gas_velocity',
-                                 disturbance_magnitude=0.2,
+                                 disturbance=None,
+                                 disturbance_magnitude=0.0,
                                  n_zones=10,
                                  **params):
     """Simplified step-response simulation wrapper."""
