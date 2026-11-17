@@ -15,7 +15,7 @@ Governing equations discretized along column height z using method of lines:
 import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.integrate import trapezoid
-from performance import from_simulation_result
+from performance import ColumnPerformance, from_simulation_result
 
 
 # ============================================================================
@@ -53,6 +53,21 @@ EPS_L_DEFAULT = 0.15  # liquid holdup (-)
 T_INLET = 40.0  # °C - flue gas inlet temperature (z=0)
 T_REBOILER_IN = 120.0  # °C - reboiler inlet
 T_REBOILER_OUT = 140.0  # °C - reboiler outlet
+
+# Stripping steam: a CONSTANT assumption. The reduced state vector has no
+# gas-phase water, so Q_steam cannot be coupled to the overhead in this build.
+N_H2O_OVERHEAD_ASSUMED = 0.023  # mol/s
+DH_VAP_H2O_KJ_MOL = 40.7        # kJ/mol
+
+
+def load_design_basis(path="design_basis.yaml"):
+    """Load the design basis once; returns {} when the file is absent."""
+    import yaml
+    try:
+        with open(path, "r") as handle:
+            return yaml.safe_load(handle) or {}
+    except FileNotFoundError:
+        return {}
 
 
 # ============================================================================
@@ -772,6 +787,9 @@ def simulate_column_mol(
     - Stiffness removed: no free dissolved CO2 differential state
     - Enhancement factor closed algebraically
     """
+    if duration <= 0:
+        raise ValueError(f"duration must be > 0 s (got {duration})")
+
     N = n_zones
     
     # Default parameters
@@ -788,7 +806,15 @@ def simulate_column_mol(
         'T_liquid_inlet': params.get('T_liquid_inlet', 40.0),
         'C_G_CO2_inlet': params.get('C_G_CO2_inlet', 8.0),
         'design_basis': params.get('design_basis', 'pilot'),
+        'm_solvent': params.get('m_solvent', None),
     }
+
+    # Reboiler UA and ambient temperature from the design basis. Reported,
+    # never silently replaced with the docstring value.
+    db = load_design_basis()
+    UA_source = 'design_basis.yaml' if 'UA_reboiler_W_per_K' in db else 'fallback_default'
+    UA_reboiler = float(params.get('UA_reboiler', db.get('UA_reboiler_W_per_K', 50.0)))
+    T_ambient = float(params.get('T_ambient', db.get('T_ambient_C', 40.0)))
     
     # Apply disturbance
     t_disturbance = 60.0  # seconds into simulation (after startup)
@@ -811,14 +837,9 @@ def simulate_column_mol(
         # Ensure positive velocities
         params_local['u_G'] = max(0.1, params_local['u_G'])
         
-        # Solve ODE system
-        try:
-            result = mol_column_odes(t, state, N, params_local)
-            return result
-        except Exception as e:
-            print(f"ODE solve error at t={t}: {e}")
-            N_fallback = default_params['n_zones']
-            return np.zeros(4 * N_fallback)
+        # Errors propagate: a failed RHS must not look like a converged run.
+
+        return mol_column_odes(t, state, N, params_local)
     
     # Time points
     n_points = int(duration / dt) + 1
@@ -829,140 +850,128 @@ def simulate_column_mol(
                                               if k != 'n_zones'})
     
     # Solve
-    try:
-        sol = solve_ivp(
-            ode_system,
-            [0, duration],
-            y0,
-            method='RK45',
-            t_eval=times,
-            rtol=1e-4,
-            atol=1e-6,
-            max_step=dt
+    sol = solve_ivp(
+        ode_system,
+        [0, duration],
+        y0,
+        method='RK45',
+        t_eval=times,
+        rtol=1e-4,
+        atol=1e-6,
+        max_step=dt
+    )
+    
+    # Organize results
+    results = {
+        'times': sol.t,
+    }
+    
+    # Reshape state history: (4*N_zones, n_points) -> per-variable arrays
+    state_history = np.asarray(sol.y)
+    if state_history.ndim == 1:  # single-point time grid
+        state_history = state_history.reshape(-1, 1)
+    
+    C_G_CO2_history = state_history[0::4, :]  # shape: (N, n_points)
+    alpha_history = state_history[1::4, :]    # shape: (N, n_points) — loading
+    T_gas_history = state_history[2::4, :]    # shape: (N, n_points)
+    T_liquid_history = state_history[3::4, :] # shape: (N, n_points)
+    
+    results['C_G_CO2'] = C_G_CO2_history.T  # (n_points, N)
+    results['alpha'] = alpha_history.T        # (n_points, N) — loading
+    results['T_gas'] = T_gas_history.T
+    results['T_liquid'] = T_liquid_history.T
+    results['z_positions'] = np.linspace(0, COLUMN_HEIGHT, N)
+    
+    # Calculate derived quantities per time step
+    C_G_inlet = default_params.get('C_G_CO2_inlet', 8.0)
+    results['capture_efficiency'] = 100.0 * (1.0 -
+        results['C_G_CO2'][:, -1] / C_G_inlet)  # outlet (top, z=H) CO2
+    
+    # Overall CO2 removal rate (mol/s)
+    A_cs = np.pi * (COLUMN_DIAMETER/2.0)**2  # m²
+    G_flow = default_params.get('u_G', UG_DEFAULT) * A_cs  # m³/s gas flow rate
+    C_G_inlet_profile = default_params.get('C_G_CO2_inlet', 8.0)
+    results['co2_removal_mol_s'] = G_flow * (C_G_inlet_profile - results['C_G_CO2'][:, -1])
+    
+    # --- Reboiler energy duty ------------------------------------------------
+    m_solvent = default_params.get('m_solvent', None)
+    T_liquid_reb = results['T_liquid'][:, 0]      # liquid T at reboiler node
+    alpha_reb = results['alpha'][:, 0]            # loading at reboiler node
+    alpha_rich = float(np.mean(alpha_reb))
+    alpha_lean = float(np.mean(results['alpha'][:, -1]))
+
+    Cp = 4.18  # kJ/kg/K, aqueous MEA (placeholder)
+
+    if m_solvent is None:
+        Q_sensible = 0.0
+        Q_sens_source = "unconfigured:m_solvent=None"
+    else:
+        # HX approach placeholder: feed -> reboiler inlet (module design temps).
+        Q_sensible = m_solvent * Cp * (T_REBOILER_OUT - T_REBOILER_IN)
+        Q_sens_source = "hx_approach_placeholder"
+
+    # ONE time aggregate for both duty and flow (was max() here, mean() there).
+    n_CO2_avg = max(float(np.mean(results['co2_removal_mol_s'])), 0.0)
+    Q_desorption = abs(ΔH_CARBAMATE) * n_CO2_avg   # kJ/s = kW
+
+    # Stripping steam: a CONSTANT, not coupled to overhead water.
+    Q_steam = N_H2O_OVERHEAD_ASSUMED * DH_VAP_H2O_KJ_MOL
+    steam_source = (
+        f"constant:n_H2O_overhead={N_H2O_OVERHEAD_ASSUMED} mol/s (uncoupled)"
+    )
+
+    Q_loss = UA_reboiler * max(float(np.max(T_liquid_reb)) - T_ambient, 1.0) / 1000.0
+    Q_reb = Q_sensible + Q_desorption + Q_steam + Q_loss
+
+    m_CO2 = n_CO2_avg * CO2_MOLAR_MASS
+    if m_CO2 <= 0:
+        raise ValueError(
+            "CO2 removal is zero: specific energy is undefined "
+            f"(n_CO2_avg={n_CO2_avg:.3e} mol/s). Refusing to emit a 0.0 SRD."
         )
-        
-        # Organize results
-        results = {
-            'times': sol.t,
-        }
-        
-        # Reshape state history: (4*N_zones, n_points) -> per-variable arrays
-        state_history = sol.y  # shape: (4*N, n_points)
-        
-        C_G_CO2_history = state_history[0::4, :]  # shape: (N, n_points)
-        alpha_history = state_history[1::4, :]    # shape: (N, n_points) — loading
-        T_gas_history = state_history[2::4, :]    # shape: (N, n_points)
-        T_liquid_history = state_history[3::4, :] # shape: (N, n_points)
-        
-        results['C_G_CO2'] = C_G_CO2_history.T  # (n_points, N)
-        results['alpha'] = alpha_history.T        # (n_points, N) — loading
-        results['T_gas'] = T_gas_history.T
-        results['T_liquid'] = T_liquid_history.T
-        results['z_positions'] = np.linspace(0, COLUMN_HEIGHT, N)
-        
-        # Calculate derived quantities per time step
-        C_G_inlet = default_params.get('C_G_CO2_inlet', 8.0)
-        results['capture_efficiency'] = 100.0 * (1.0 -
-            results['C_G_CO2'][:, -1] / C_G_inlet)  # outlet (top, z=H) CO2
-        
-        # Overall CO2 removal rate (mol/s)
-        A_cs = np.pi * (COLUMN_DIAMETER/2.0)**2  # m²
-        G_flow = default_params.get('u_G', UG_DEFAULT) * A_cs  # m³/s gas flow rate
-        C_G_inlet_profile = default_params.get('C_G_CO2_inlet', 8.0)
-        results['co2_removal_mol_s'] = G_flow * (C_G_inlet_profile - results['C_G_CO2'][:, -1])
-        
-        # Reboiler energy duty (per time step)
-        T_liquid_reb = results['T_liquid'][:, 0]  # liquid temp at bottom
-        alpha_reb = results['alpha'][:, 0]        # loading at bottom
-        
-        # Design basis
-        design = default_params.get('design_basis', 'pilot')
-        m_solvent = default_params.get('m_solvent', None)
-        
-        Cp = 4.18  # kJ/kg·K
-        
-        # Sensible heat duty
-        Q_sensible = m_solvent * Cp * (T_REBOILER_OUT - T_REBOILER_IN) if m_solvent else 0.0
-        
-        # Desorption heat: based on actual CO2 stripped from rich to lean loading
-        # Use average loading difference across simulation
-        alpha_rich_estimate = max(alpha_reb)  # max loading seen at reboiler
-        alpha_lean_estimate = min(alpha_reb)  # min loading seen at top
-        # CO2 stripped = m_solvent * (alpha_rich - alpha_lean) * MEA_MOLAR_MASS? 
-        # Actually: CO2 molar stripped = m_solvent * (alpha_rich - alpha_lean)
-        # where m_solvent is in mol MEA/s or we need flow rate.
-        # Let's use: m_CO2_stripped_mol_s = m_solvent_mol_s * (alpha_rich - alpha_lean)
-        # But m_solvent is currently in kg/s or unknown. Use default.
-        # 
-        # From the design basis, with m_solvent_kg_s and loading diff:
-        # CO2 stripped mol/s = m_solvent_kg_s / MEA_MOLAR_MASS * (alpha_rich - alpha_lean) / (something)
-        # Actually the solvent molar flow isn't directly m_solvent_kg_s / MEA_MOLAR_MASS
-        # because the solvent is aqueous MEA, not pure MEA.
-        # 
-        # Simplified: use the loading difference directly.
-        # CO2 removal is already computed from gas phase above.
-        # For desorption heat, use the gas-phase CO2 removal * |ΔH|.
-        
-        # Use the co2_removal_mol_s already computed
-        m_CO2_stripped_mol_s = np.maximum(results['co2_removal_mol_s'].max(), 0)  # mol/s
-        Q_desorption = abs(ΔH_CARBAMATE) * m_CO2_stripped_mol_s  # kJ/s = kW
-        Q_steam = 0.023 * 40.7  # n_H2O_overhead * DH_VAP_H2O, kW (stripping steam enthalpy)
-        Q_steam = 0.023 * 40.7  # n_H2O_overhead * DH_VAP_H2O, kW (stripping steam enthalpy)
-        
-        # Loss term: physics-based, sized to 2-5% of sensible duty
-        T_ambient = default_params.get('T_ambient', 40.0)  # °C
-        
-        results['reboiler_duty'] = {
-            'total_duty_kw': Q_sensible + Q_desorption + Q_steam + Q_loss,
-            'sensible_kw': Q_sensible,
-            'desorption_kw': Q_desorption,
-            'Q_steam': Q_steam,
-            'loss_kw': Q_loss,
-            'T_liquid_reb': T_liquid_reb,
-            'alpha_rich': alpha_reb,
-        }
-        
-        # Specific energy consumption
-        if results['co2_removal_mol_s'].max() > 0:
-            try:
-                total_energy = trapezoid(
-                    [r['total_duty_kw'] if isinstance(r, dict) else r 
-                     for r in [results['reboiler_duty']] * len(times)],
-                    times
-                ) / len(times)
-            except Exception:
-                total_energy = 0.0
-                for i in range(len(times) - 1):
-                    dt_i = times[i+1] - times[i]
-                    total_energy += (results['reboiler_duty']['total_duty_kw'] * dt_i)
-                total_energy /= len(times)
-            
-            # CO2 removed in kg/s: mol/s * M_CO2
-            co2_kg_s = results['co2_removal_mol_s'].max() * CO2_MOLAR_MASS
-            if co2_kg_s > 0:
-                results['specific_energy_kwh_kgco2'] = total_energy / 3600.0 / co2_kg_s  # kWh/kg CO2
-            else:
-                results['specific_energy_kwh_kgco2'] = 0.0
-        else:
-            results['specific_energy_kwh_kgco2'] = 0.0
-        
-        return times, results
-        
-    except Exception as e:
-        print(f"Simulation failed: {e}")
-        times = np.linspace(0, duration, 50)
-        return times, {
-            'times': times,
-            'C_G_CO2': np.full((len(times), N), 8.0),
-            'alpha': np.full((len(times), N), 0.05),
-            'T_gas': np.full((len(times), N), 40.0),
-            'T_liquid': np.full((len(times), N), 40.0),
-            'capture_efficiency': np.full(len(times), 90.0),
-            'co2_removal_mol_s': np.zeros(len(times)),
-            'reboiler_duty': {'total_duty_kw': 2500.0, 'sensible_kw': 0.0, 'desorption_kw': 0.0, 'loss_kw': 5000.0},
-            'specific_energy_kwh_kgco2': 0.0,
-            'z_positions': np.linspace(0, COLUMN_HEIGHT, N),
-        }
+
+    srd_GJt = Q_reb / m_CO2 / 1e3
+    srd_kwh_kg = srd_GJt / 3.6
+    capture_pct = float(np.mean(results['capture_efficiency']))
+
+    perf = ColumnPerformance(
+        Q_sens=Q_sensible,
+        Q_desorp=Q_desorption,
+        Q_steam=Q_steam,
+        Q_loss=Q_loss,
+        Q_reb=Q_reb,
+        n_CO2=n_CO2_avg,
+        m_CO2=m_CO2,
+        specific_energy_GJt=srd_GJt,
+        specific_energy_kwh_kg=srd_kwh_kg,
+        capture_efficiency_pct=capture_pct,
+        steam_source=steam_source,
+        Q_sens_source=Q_sens_source,
+        T_liquid_reb=float(np.mean(T_liquid_reb)),
+        m_solvent=m_solvent,
+        alpha_rich=alpha_rich,
+        alpha_lean=alpha_lean,
+        UA_reboiler_W_K=UA_reboiler,
+    )
+
+    results['reboiler_duty'] = {
+        'total_duty_kw': Q_reb,
+        'sensible_kw': Q_sensible,
+        'desorption_kw': Q_desorption,
+        'Q_steam': Q_steam,
+        'loss_kw': Q_loss,
+        'T_liquid_reb': T_liquid_reb,
+        'alpha_rich': alpha_reb,
+    }
+    results['n_CO2_avg'] = n_CO2_avg
+    results['m_CO2'] = m_CO2
+    results['specific_energy_kwh_kg'] = srd_kwh_kg
+    results['capture_efficiency_pct'] = capture_pct
+    results['ua_source'] = UA_source
+    results['performance'] = perf
+
+    return times, results
+    
 
 
 # ============================================================================
@@ -973,77 +982,49 @@ def calculate_column_performance_mol(simulation_result,
                                      C_G_inlet=8.0,
                                      m_solvent=1.0,
                                      **params):
-    """Calculate performance metrics from a MOL simulation result.
-    
-    Key: specific energy now correctly reports in kWh/kg and GJ/t
-    with the physics-based loss term replacing the hard-coded 5000 kW.
+    """Return a performance dict built from the enforced schema.
+
+    Accepts a results dict that already carries a ColumnPerformance in
+    ``results['performance']`` (the live path) or a legacy dict convertible by
+    ``from_simulation_result``. No flat key is required that is not consumed.
     """
-    try:
+    perf = None
+    if isinstance(simulation_result, dict):
+        perf = simulation_result.get('performance')
+    if perf is None:
         perf = from_simulation_result(simulation_result)
-    except KeyError as e:
-        raise KeyError(f"Missing required key in simulation_result: {e}. No .get(...,0.0) defaults -- all keys must be present.")
+    if not isinstance(perf, ColumnPerformance):
+        raise TypeError(f"expected ColumnPerformance, got {type(perf).__name__}")
 
-    # 2. Pull metrics from the enforced schema object
-    times = simulation_result['times']
-    C_G_CO2 = simulation_result['C_G_CO2']  # (n_points, N)
-    alpha = simulation_result.get('alpha', np.full_like(C_G_CO2, 0.05))
-    T_liquid = simulation_result['T_liquid']
-
-    N = C_G_CO2.shape[1]
-    z_positions = simulation_result.get('z_positions', np.linspace(0, COLUMN_HEIGHT, N))
-
-    # 3. Outlet capture efficiency
-    C_G_outlet = C_G_CO2[:, -1]
-    capture_efficiency = 100.0 * (1.0 - C_G_outlet / C_G_inlet)
-    avg_capture_eff = np.mean(capture_efficiency)
-
-    # 4. CO2 removal rate (mol/s)
-    A_cs = np.pi * (COLUMN_DIAMETER/2.0)**2  # m2
-    u_G = params.get('u_G', UG_DEFAULT)
-    G_flow = u_G * A_cs  # m3/s gas flow rate
-    co2_removal_avg = G_flow * np.mean(C_G_inlet - C_G_CO2[:, -1])
-
-    # 5. Reboiler duty and energy metrics from schema
-    # T_liquid_reb comes from simulation result, not ColumnPerformance schema
-    T_liquid_reb = simulation_result['T_liquid_reb']  # liquid temp at bottom node
-    # alpha_reb comes from simulation result
-    alpha_reb = simulation_result.get('alpha', np.full((len(simulation_result['times']), simulation_result['C_G_CO2'].shape[1]), 0.05))[:, 0]
-    n_CO2 = perf.n_CO2  # mol/s captured from schema
-    m_CO2 = perf.m_CO2  # kg/s captured from schema
-
-    # 6. Specific energy from schema (enforced, no 0.0 default)
-    specific_energy_GJt = perf.specific_energy_GJt  # GJ/tonne CO2
-    specific_energy_kwh_kg = perf.specific_energy_kwh_kg  # kWh/kg CO2
-
-    # 7. Reboiler duty breakdown from schema
-    total_duty = perf.Q_reb  # kW
-    Q_sensible = perf.Q_sens  # kW
-    Q_desorp = perf.Q_desorp  # kW
-    Q_steam = perf.Q_steam  # kW
-    Q_loss = perf.Q_loss  # kW
-
-    # 8. Design basis info (supplemental, not used in schema)
-    design_basis = params.get('design_basis', 'pilot')
-
-    # 9. Approach temperature
-    approach_temp = params.get('T_gas_inlet', 40.0) - params.get('T_liquid_inlet', 40.0)
-
-    # 10. Per-zone profiles
-    alpha_avg_by_z = np.mean(alpha, axis=0)  # (N,) average loading per zone
-
-    return {
-        'avg_capture_efficiency_%': avg_capture_eff,
-        'co2_removal_mol_s_avg': co2_removal_avg,
-        'co2_removal_kg_h': co2_removal_avg * CO2_MOLAR_MASS * 3600.0 / 1000.0,  # kg/h
-        'reboiler_duty_kw': total_duty,
-        'specific_energy_kwh_kg': specific_energy_kwh_kg,  # kWh/kg CO2
-        'specific_energy_GJt': specific_energy_GJt,  # GJ/tonne CO2 (industry standard)
-        'approach_temp_K': approach_temp,
-        'alpha_avg_by_z': alpha_avg_by_z,  # per-zone average loading
-        'T_gas_avg_by_z': np.mean(simulation_result.get('T_gas', np.zeros((len(times), N))), axis=0),
-        'T_liquid_avg_by_z': np.mean(T_liquid, axis=0),  # per-zone average temp
-        'z_positions': z_positions,
+    payload = {
+        'performance': perf,
+        'validation_flags': perf.validation_flags(),
+        'avg_capture_efficiency_%': perf.capture_efficiency_pct,
+        'co2_removal_mol_s_avg': perf.n_CO2,
+        'co2_removal_kg_h': perf.n_CO2 * CO2_MOLAR_MASS * 3600.0 / 1000.0,
+        'reboiler_duty_kw': perf.Q_reb,
+        'Q_sens': perf.Q_sens,
+        'Q_desorp': perf.Q_desorp,
+        'Q_steam': perf.Q_steam,
+        'Q_loss': perf.Q_loss,
+        'specific_energy_kwh_kg': perf.specific_energy_kwh_kg,
+        'specific_energy_GJt': perf.specific_energy_GJt,
     }
+
+    if isinstance(simulation_result, dict) and 'C_G_CO2' in simulation_result:
+        payload['z_positions'] = simulation_result.get('z_positions')
+        if simulation_result.get('alpha') is not None:
+            payload['alpha_avg_by_z'] = np.mean(simulation_result['alpha'], axis=0)
+        if simulation_result.get('T_liquid') is not None:
+            payload['T_liquid_avg_by_z'] = np.mean(
+                simulation_result['T_liquid'], axis=0)
+        payload['approach_temp_K'] = (
+            params.get('T_gas_inlet', 40.0) - params.get('T_liquid_inlet', 40.0)
+        )
+
+    return payload
+
+
 
 def simulate_column_step_response(duration=300, dt=1.0,
                                  disturbance='gas_velocity',
@@ -1060,8 +1041,9 @@ def simulate_column_step_response(duration=300, dt=1.0,
         **params
     )
     
-    perf = calculate_column_performance_mol(results, **params)
-    results['performance'] = perf
+    if not isinstance(results.get('performance'), ColumnPerformance):
+        results['performance'] = calculate_column_performance_mol(
+            results, **params)['performance']
     
     return times, results
 
@@ -1073,67 +1055,27 @@ def simulate_column_step_response(duration=300, dt=1.0,
 if __name__ == "__main__":
     print("=== Rate-Based MEA Column Model with MOL PDE Discretization ===\n")
     
-    # 1. Test basic simulation with MOL (10 zones)
-    print("1. MOL Simulation (10 spatial zones, 60s, gas velocity disturbance)...")
-    try:
-        times, results = simulate_column_step_response(
-            duration=60.0,
-            dt=1.0,
-            disturbance='gas_velocity',
-            disturbance_magnitude=0.2,
-            n_zones=10,
-            u_G=1.5,
-            u_L=0.02,
-        )
-        print(f"   ✓ Simulation completed: {len(times)} time points")
-        print(f"   ✓ Capture efficiency: {results['performance']['avg_capture_efficiency_%']:.1f}%")
-        print(f"   ✓ CO2 removal: {results['performance']['co2_removal_kg_h']:.1f} kg/h")
-        print(f"   ✓ Reboiler duty: {results['performance']['reboiler_duty_kw']:.1f} kW")
-        print(f"   ✓ Specific energy: {results['performance']['specific_energy_kwh_kgco2']:.2f} kWh/kg CO2")
-        print(f"   ✓ Specific energy GJ/t: {results['performance']['specific_energy_GJt']:.2f} GJ/t")
-        print(f"   ✓ z-profile nodes: {len(results['performance']['z_positions'])}")
-    except Exception as e:
-        print(f"   ✗ Simulation error: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # 2. Compare energy decomposition
-    print("\n2. Energy decomposition check:")
-    perf = results.get('performance', {})
-    if perf:
-        td = perf.get('reboiler_duty_kw', 0)
-        sq = perf.get('sensible_kw', 'N/A')
-        dq = perf.get('desorption_kw', 'N/A')
-        lq = perf.get('loss_kw', 'N/A')
-        print(f"   Total duty: {td:.1f} kW")
-        if sq != 'N/A': print(f"   Sensible:   {sq:.1f} kW")
-        if dq != 'N/A': print(f"   Desorption: {dq:.1f} kW")
-        if lq != 'N/A': print(f"   Loss:       {lq:.1f} kW")
-        # Check closure
-        if all(x != 'N/A' for x in [sq, dq, lq]):
-            closure = td - sq - dq - lq
-            print(f"   Closure:    {td:.1f} - {sq:.1f} - {dq:.1f} - {lq:.1f} = {closure:.1f} kW {'✓' if abs(closure) < 1.0 else '✗'}")
-    
-    # 3. Increase spatial resolution
-    print("\n3. MOL with increased resolution (20 zones)...")
-    try:
-        times20, results20 = simulate_column_step_response(
-            duration=60.0,
-            dt=1.0,
-            disturbance='gas_velocity',
-            disturbance_magnitude=0.2,
-            n_zones=20,
-            u_G=1.5,
-        )
-        perf20 = results20.get('performance', {})
-        print(f"   ✓ 20-zone simulation completed")
-        print(f"   ✓ Capture efficiency: {perf20.get('avg_capture_efficiency_%', 'N/A'):.1f}%")
-        print(f"   ✓ Specific energy: {perf20.get('specific_energy_kwh_kgco2', 'N/A'):.2f} kWh/kg CO2")
-        print(f"   ✓ Specific energy GJ/t: {perf20.get('specific_energy_GJt', 'N/A'):.2f} GJ/t")
-        print(f"   ✓ z-resolution: {len(perf20.get('z_positions', []))} nodes")
-    except Exception as e:
-        print(f"   ✗ 20-zone error: {e}")
-    
+    # 1. Live decomposition. Flags may be False -- that is the diagnostic,
+    #    not a failure to hide.
+    print("1. Live MOL simulation and decomposition...")
+    times, results = simulate_column_step_response(
+        duration=60.0,
+        dt=1.0,
+        disturbance='gas_velocity',
+        disturbance_magnitude=0.2,
+        n_zones=10,
+        u_G=1.5,
+        u_L=0.02,
+    )
+    p = results['performance']
+    print(f"   t_end={times[-1]:.0f}s  n_points={len(times)}  "
+          f"N={results['C_G_CO2'].shape[1]}  solver=RK45")
+    print(p)
+    print("   validation_flags:")
+    for key, value in p.validation_flags().items():
+        print(f"     {key:34s}: {value}")
+
+
     # 4. Test two-film with Formulation B (no unit mismatch)
     print("\n4. Two-film mass transfer Formulation B test:")
     try:
