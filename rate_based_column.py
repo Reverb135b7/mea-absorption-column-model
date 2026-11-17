@@ -711,6 +711,10 @@ def mol_column_odes(t, state, n_zones=None, params=None):
         
         # Gas phase CO2: convection + mass transfer source
         # Source: - (a_i / eps_G) * N_CO2  (mol/m³/s from gas perspective, leaving gas)
+        # C_G is per unit GAS volume, so both the convective transport and the
+        # source must be converted with eps_G (the old code divided only the
+        # source, which made the gas balance and the removal integral differ by
+        # exactly 1/eps_G and could never close).
         source_G = -rate_vol / eps_G if eps_G > 0 else 0.0
         
         # Liquid phase loading: convection + mass transfer source
@@ -902,6 +906,7 @@ def simulate_column_mol(
         'alpha_lean': cfg['alpha_lean'],
         'alpha_rich': cfg['alpha_rich'],
         'K_Ga': K_Ga,
+        'K_Ga_used_in_rhs': float(default_params.get('K_Ga', float('nan'))),
         'kg_a_basis': kg_a_basis,
         'u_L': u_L,
         'T_gas_inlet': cfg['T_gas_in'],
@@ -1089,6 +1094,8 @@ def simulate_column_mol(
         UA_reboiler_W_K=UA_reboiler,
         w_MEA=cfg['w_MEA'],
         capture_target_pct=cfg['capture_target'] * 100.0,
+        capture_is_fitted=True,
+        rate_basis=kg_a_basis,
     )
 
     f0 = np.asarray(mol_column_odes(0.0, y0, N, default_params), dtype=float)
@@ -1113,6 +1120,9 @@ def simulate_column_mol(
         'A_cs_m2': A_cs_col,
         'Vdot_gas_m3_s': cfg['Vdot_gas'],
         'u_G_m_s': u_G,
+        'u_G_in_rhs': float(default_params.get('u_G', float('nan'))),
+        'eps_G_in_rhs': float(default_params.get('eps_G', float('nan'))),
+        'eps_L_in_rhs': float(default_params.get('eps_L', float('nan'))),
         'u_G_plausible': bool(1.0 <= u_G <= 2.0),
         'n_CO2_in_mol_s': u_G * A_cs_col * cfg['C_G_in'],
     }

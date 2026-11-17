@@ -66,5 +66,5 @@ disturbance_reboiler_fraction: 0.15
 # far above what a Sherwood correlation gives at u_G = 0.17 m/s; the spread
 # between available bases is ~2 orders of magnitude, so the design point is
 # anchored on this calibration instead.
-K_Ga_mol_m3_s_Pa: 2.2004e-05
-kg_a_basis: "calibrated_to_design_capture (bisection, 90% at declared geometry, t=6000 s, N=20)"
+K_Ga_mol_m3_s_Pa: 1.0905e-04
+kg_a_basis: "calibrated_to_design_capture (bisection, 90% at t=20000 s = 4 tau_L, N=20)"

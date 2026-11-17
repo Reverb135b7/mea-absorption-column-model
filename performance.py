@@ -112,6 +112,10 @@ class ColumnPerformance:
     w_MEA: float = W_MEA_DEFAULT
     #: Design capture target, %
     capture_target_pct: float = 90.0
+    #: True when the capture figure was produced by fitting a rate coefficient
+    capture_is_fitted: bool = False
+    #: Provenance string for the rate coefficient that produced the capture
+    rate_basis: str = ""
 
     # Class-level constants
     _DH_ABS: ClassVar[float] = DH_ABS
@@ -201,6 +205,8 @@ class ColumnPerformance:
                 0.0 < self.capture_efficiency_pct <= 100.0
             ),
             "capture_target_pct": self.capture_target_pct,
+            "capture_is_fitted": self.capture_is_fitted,
+            "rate_basis": self.rate_basis,
             "capture_target_met": bool(
                 abs(self.capture_efficiency_pct - self.capture_target_pct) <= 2.0
             ),
@@ -251,7 +257,9 @@ class ColumnPerformance:
     # ------------------------------------------------------------------
     def __repr__(self) -> str:
         lines = [
-            f"capture_efficiency      : {self.capture_efficiency_pct:6.1f} %",
+            f"capture_efficiency      : {self.capture_efficiency_pct:6.1f} %"
+            + ("  [FITTED: K_Ga calibrated to this target — not a prediction]"
+               if self.capture_is_fitted else ""),
             f"n_CO2_captured          : {self.n_CO2:8.4f} mol/s",
             f"m_CO2_captured          : {self.m_CO2:8.5f} kg/s",
             f"Q_sens                  : {self.Q_sens:7.1f} kW  [{self.Q_sens_source}]",
