@@ -371,11 +371,16 @@ def two_film_mass_transfer_with_enhancement(C_G, alpha, T, K_G=K_G_DEFAULT,
     # --- Step 1: Equilibrium partial pressure from loading ---
     # P_star = H * alpha / (1 - alpha/alpha_max)
     alpha_max = 0.5  # mol CO2 / mol MEA max
-    if alpha >= alpha_max:
+    # Saturation is asymptotic: P_star -> inf as alpha -> alpha_max, so the
+    # driving force vanishes there by itself. A solver overshoot of a few parts
+    # in 1e4 is numerical, not a capacity violation; only reject a real one and
+    # evaluate the VLE on the closed interval.
+    if alpha > alpha_max * (1.0 + 2e-3):
         raise ValueError(
-            f"liquid loading alpha={alpha:.6f} reached saturation "
+            f"liquid loading alpha={alpha:.6f} exceeded saturation "
             f"(alpha_max={alpha_max}) at T={T:.1f} C"
         )
+    alpha = min(alpha, alpha_max * (1.0 - 1e-9))
     H = henry_constant_Pa_m3_mol(T)
     P_star = H * alpha / (1.0 - alpha / alpha_max)
     
@@ -693,8 +698,12 @@ def mol_column_odes(t, state, n_zones=None, params=None):
             conv_T_liquid = 0.0
             liquid_inlet = True
         else:
-            conv_alpha = (alpha[i] - alpha[i + 1]) / dz
-            conv_T_liquid = (T_liquid[i] - T_liquid[i + 1]) / dz
+            # Liquid flows in -z: cell i receives from i+1 and discharges its
+            # own holdup, so the net accumulation is (alpha[i+1] - alpha[i]).
+            # The reversed difference made the bottom node accumulate without
+            # outflow and drove alpha through the saturation ceiling.
+            conv_alpha = (alpha[i + 1] - alpha[i]) / dz
+            conv_T_liquid = (T_liquid[i + 1] - T_liquid[i]) / dz
             liquid_inlet = False
 
 
@@ -761,7 +770,12 @@ def set_initial_conditions(n_zones=N_ZONES,
         C_G_CO2 = C_G_CO2_inlet                      # flat: no seeded removal
         alpha = alpha_rich + (alpha_lean - alpha_rich) * frac  # rich bottom
         T_gas = T_gas_inlet + 5.0 * frac
-        T_liquid = T_liquid_inlet + 10.0 * frac
+        # Liquid enters cold at the top (i=N-1) and warms as it falls, so the
+        # bottom is the warm end. The previous +10*frac had it backwards: the
+        # bottom sat at 40 C, where the equilibrium loading at 21 kPa is ~0.5,
+        # so alpha was driven into the saturation ceiling instead of stopping
+        # at the design rich loading of 0.45.
+        T_liquid = T_liquid_inlet + 10.0 * (1.0 - frac)
         state.extend([C_G_CO2, alpha, T_gas, T_liquid])
     return np.array(state, dtype=float)
 
@@ -817,7 +831,7 @@ def simulate_column_mol(
     # Default parameters
     default_params = {
         'u_G': params.get('u_G', UG_DEFAULT),
-        'u_L': params.get('u_L', UL_DEFAULT),
+        'u_L': params.get('u_L_override', None) or UL_DEFAULT,
         'eps_G': params.get('eps_G', EPS_G_DEFAULT),
         'eps_L': params.get('eps_L', EPS_L_DEFAULT),
         'a_i': params.get('a_i', 250.0),
@@ -835,7 +849,7 @@ def simulate_column_mol(
     db = load_design_basis()
     cfg = {
         'D': float(db.get('column_diameter_m', COLUMN_DIAMETER)),
-        'H': float(db.get('column_height_m', COLUMN_HEIGHT)),
+        'H': float(params.get('H_override', db.get('column_height_m', COLUMN_HEIGHT))),
         'a_i': float(db.get('a_i_m2_m3', 250.0)),
         'Vdot_gas': float(db.get('gas_volumetric_flow_m3_s', 0.131)),
         'C_G_in': float(db.get('C_G_CO2_inlet_mol_m3', 8.0)),
@@ -853,6 +867,7 @@ def simulate_column_mol(
         'T_amb': float(db.get('T_ambient_C', 40.0)),
         'UA': float(params.get('UA_reboiler', db.get('UA_reboiler_W_per_K', 50.0))),
         'T_top': float(db.get('stripper_T_top_C', 85.0)),
+        'eps_L': float(db.get('liquid_holdup', 0.15)),
         'P_strip': float(db.get('stripper_P_bar', 1.5)),
     }
 
@@ -861,11 +876,23 @@ def simulate_column_mol(
 
     A_cs = np.pi * (cfg['D'] / 2.0) ** 2
     u_G = cfg['Vdot_gas'] / A_cs                       # derived, not declared
+    # Liquid velocity from the declared solvent mass flow, not a demo number:
+    # u_L = m / (rho_L * eps_L * A). With 0.7697 kg/s, 0.15 holdup and A=0.785
+    # this is 5.9 mm/s, i.e. a 5100 s liquid residence time in a 30 m column.
+    u_L_derived = cfg['m_solvent'] / (RHO_L * cfg['eps_L'] * A_cs)
+    u_L = float(params.get('u_L_override', u_L_derived))
     C_total = cfg['P'] / (8.314 * (cfg['T_gas_in'] + 273.15))
     G_M = u_G * C_total                                # mol/(m2 s)
-    NTU = -np.log(max(1.0 - cfg['capture_target'], 1e-6))
-    HTU = cfg['H'] / NTU
-    K_Ga = G_M / (HTU * cfg['P'])                      # mol/(m3 s Pa)
+    # K_G*a from the gas film, independent of column height:
+    # K_G = k_c/(RT) = 7.68e-6 mol/(m2 s Pa); K_Ga = K_G * a_i = 1.92e-3.
+    # The old K_Ga = G_M/(HTU*P) with HTU = H/NTU was circular: it was derived
+    # from H, so it could not be used to judge whether H was right, and it
+    # reported 69 % for the same design point it was calibrated on.
+    K_Ga = float(params.get('K_Ga_override',
+                            db.get('K_Ga_mol_m3_s_Pa', K_G_DEFAULT * cfg['a_i'])))
+    kg_a_basis = str(db.get('kg_a_basis', 'gas_film:K_G(7.68e-6) x a_i'))
+    NTU = K_Ga * cfg['P'] * cfg['H'] / G_M             # available, diagnostic
+    HTU = cfg['H'] / NTU if NTU > 0 else float('inf')
 
     default_params.update({
         'u_G': u_G,
@@ -875,6 +902,8 @@ def simulate_column_mol(
         'alpha_lean': cfg['alpha_lean'],
         'alpha_rich': cfg['alpha_rich'],
         'K_Ga': K_Ga,
+        'kg_a_basis': kg_a_basis,
+        'u_L': u_L,
         'T_gas_inlet': cfg['T_gas_in'],
         'C_G_CO2_inlet': cfg['C_G_in'],
     })
@@ -985,6 +1014,14 @@ def simulate_column_mol(
     # CO2 removal from the zone flux integral (not an inlet/outlet guess).
     dz_node = COLUMN_HEIGHT / (N - 1) if N > 1 else COLUMN_HEIGHT
     A_cs_col = np.pi * (COLUMN_DIAMETER / 2.0) ** 2
+    # Weights follow the discrete gas balance exactly. Summing the upwind
+    # gas equation over nodes 1..N-1 at steady state cancels the interior
+    # fluxes and leaves u_G*A*(C_in - C_out) = A*dz*sum_{i>=1} rate_vol_i.
+    # So the inlet node carries zero weight and every other node one dz
+    # (N-1 cells = H). A trapezoid halves the inlet and biases the integral
+    # high; uniform dz integrates 33.3 m of a 30 m column (+11 %).
+    w_node = np.ones(N)
+    w_node[0] = 0.0
     n_CO2_series = np.zeros(n_pts)
     for k in range(n_pts):
         acc = 0.0
@@ -992,7 +1029,7 @@ def simulate_column_mol(
             T_avg = 0.5 * (results['T_gas'][k, i] + results['T_liquid'][k, i])
             P_G = results['C_G_CO2'][k, i] * 8.314 * (T_avg + 273.15)
             P_star = equilibrium_liquid_co2_loading(results['alpha'][k, i], T_avg)
-            acc += K_Ga * max(P_G - P_star, 0.0) * A_cs_col * dz_node
+            acc += w_node[i] * K_Ga * max(P_G - P_star, 0.0) * A_cs_col * dz_node
         n_CO2_series[k] = acc
 
     n_CO2_avg = float(np.mean(n_CO2_series[w0:]))
@@ -1060,7 +1097,16 @@ def simulate_column_mol(
         'max_dy': float(np.max(np.abs(np.asarray(sol.y)[:, -1] - y0))),
         'removal_source': 'zone_flux_integral',
         'n_CO2_gas_side': n_CO2_gas_side,
+        'alpha_max_window': float(np.max(results['alpha'][w0:, :])),
+        'alpha_rich_window': float(np.mean(results['alpha'][w0:, 0])),
+        'alpha_lean_outlet': float(np.mean(results['alpha'][w0:, -1])),
+        'n_CO2_flux_integral': n_CO2_avg,
+        'mass_balance_residual': float(
+            (n_CO2_avg - n_CO2_gas_side) / n_CO2_gas_side
+        ),
         'K_Ga': K_Ga,
+        'kg_a_basis': kg_a_basis,
+        'u_L': u_L,
         'HTU_m': HTU,
         'NTU': NTU,
         'D_m': cfg['D'],

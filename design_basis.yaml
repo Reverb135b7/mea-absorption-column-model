@@ -56,3 +56,15 @@ default_n_zones: 10
 disturbance_gas_velocity_fraction: 0.2
 disturbance_inlet_temp_fraction: 0.1
 disturbance_reboiler_fraction: 0.15
+
+# --- Gas-side rate coefficient (calibrated, not predictive) ------------------
+# Single fitted coefficient in the model. Solved so the rate-based column
+# reproduces design_capture_fraction at the declared geometry, throughput and
+# loading swing: bisection over K_Ga, 20 nodes, t=4000 s (7 iterations,
+# 1e-5 .. 3e-4 mol/(m3 s Pa)). The gas-film alternative (K_G*a = 1.9e-3)
+# over-predicts capture (96 %) because K_G = k_c/(RT) with k_c = 0.2 m/s is
+# far above what a Sherwood correlation gives at u_G = 0.17 m/s; the spread
+# between available bases is ~2 orders of magnitude, so the design point is
+# anchored on this calibration instead.
+K_Ga_mol_m3_s_Pa: 2.2004e-05
+kg_a_basis: "calibrated_to_design_capture (bisection, 90% at declared geometry, t=6000 s, N=20)"
