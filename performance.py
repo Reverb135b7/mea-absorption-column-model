@@ -116,6 +116,12 @@ class ColumnPerformance:
     capture_is_fitted: bool = False
     #: Provenance string for the rate coefficient that produced the capture
     rate_basis: str = ""
+    #: Geometry / grid / duration flags propagated from the run
+    u_G_plausible: bool = False
+    grid_converged: bool = False
+    duration_independent: bool = False
+    K_Ga_source: str = "correlation"
+    K_Ga_fit_over_correlation: float = 1.0
 
     # Class-level constants
     _DH_ABS: ClassVar[float] = DH_ABS
@@ -207,6 +213,11 @@ class ColumnPerformance:
             "capture_target_pct": self.capture_target_pct,
             "capture_is_fitted": self.capture_is_fitted,
             "rate_basis": self.rate_basis,
+            "u_G_plausible": self.u_G_plausible,
+            "grid_converged": self.grid_converged,
+            "duration_independent": self.duration_independent,
+            "K_Ga_source": self.K_Ga_source,
+            "K_Ga_fit_over_correlation": self.K_Ga_fit_over_correlation,
             "capture_target_met": bool(
                 abs(self.capture_efficiency_pct - self.capture_target_pct) <= 2.0
             ),

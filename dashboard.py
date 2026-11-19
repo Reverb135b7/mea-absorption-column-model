@@ -17,7 +17,7 @@ warnings.filterwarnings('ignore')
 
 # Import project modules
 from lstm_soft_sensor import create_model, MEASoftSensorLSTM
-from rate_based_column import simulate_column_step_response, reboiler_energy_duty, calculate_column_performance
+from rate_based_column import simulate_column_step_response, calculate_column_performance, reboiler_energy_duty
 from synthetic_data import generate_synthetic_dataset, quick_inspection
 
 # Page configuration

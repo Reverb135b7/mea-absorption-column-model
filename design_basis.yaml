@@ -2,7 +2,7 @@
 # Throughput is declared, not inferred from a hard-coded diameter and velocity.
 
 # --- geometry -------------------------------------------------------------
-column_diameter_m: 1.0
+column_diameter_m: 0.408
 column_height_m: 30.0
 a_i_m2_m3: 250.0
 
@@ -16,7 +16,7 @@ design_capture_fraction: 0.90
 gas_temperature_inlet_C: 40.0
 gas_pressure_Pa: 101325.0
 
-# Derived: u_G = Vdot / (pi D^2/4) = 0.131 / 0.7854 = 0.167 m/s
+# Derived: u_G = Vdot / (pi D^2/4) = 0.131 / 0.1307 = 1.00 m/s
 # (low for structured packing; kept as a flag, not hidden)
 
 # --- solvent --------------------------------------------------------------
@@ -57,14 +57,9 @@ disturbance_gas_velocity_fraction: 0.2
 disturbance_inlet_temp_fraction: 0.1
 disturbance_reboiler_fraction: 0.15
 
-# --- Gas-side rate coefficient (calibrated, not predictive) ------------------
-# Single fitted coefficient in the model. Solved so the rate-based column
-# reproduces design_capture_fraction at the declared geometry, throughput and
-# loading swing: bisection over K_Ga, 20 nodes, t=4000 s (7 iterations,
-# 1e-5 .. 3e-4 mol/(m3 s Pa)). The gas-film alternative (K_G*a = 1.9e-3)
-# over-predicts capture (96 %) because K_G = k_c/(RT) with k_c = 0.2 m/s is
-# far above what a Sherwood correlation gives at u_G = 0.17 m/s; the spread
-# between available bases is ~2 orders of magnitude, so the design point is
-# anchored on this calibration instead.
-K_Ga_mol_m3_s_Pa: 1.4655e-04
-kg_a_basis: "calibrated_to_design_capture (bisection, 90% at t=20000 s = 4 tau_L, N=40)"
+# --- Gas-side rate coefficient (correlation-based, not fitted) ----------------
+# Derived from Billet-Schultes gas-film correlation at the corrected geometry
+# (D=0.408 m, u_G~1 m/s, eps_L from Billet-Schultes at the corrected liquid
+# load). capture_is_fitted=False: the model predicts capture, it does not fit it.
+K_Ga_mol_m3_s_Pa: 7.0e-04
+kg_a_basis: "Billet-Schultes gas-film correlation (C_G=0.054)"
