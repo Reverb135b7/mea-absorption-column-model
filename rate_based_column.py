@@ -51,45 +51,67 @@ NUM_TRAYS = 10
 N_ZONES = 10
 
 # --- Grid convergence record ---------------------------------------------
-# Measured by integrating THIS semi-discrete system to steady state (transient
-# run: MUSCL/minmod gas scheme, CONSERVATIVE face-flux liquid advection,
-# second-order inlet closures, signed two-film flux so the liquid may also
-# desorb). The steady state is unique: at N=20 the flat start, a start from the
-# N=80 profile and dt = 2 s vs 10 s all settle on 85.8797 %.
-#   N     capture (%)   swing residual
-#   20    85.8797       2.42 %
-#   40    86.1949       1.67 %
-#   80    87.5941       0.17 %
-# Successive differences: 0.315 pp (20->40) and 1.399 pp (40->80), i.e. the
-# increments GROW with refinement and the observed order logs out negative
-# (-2.15). The criterion (delta < 0.2 pp, order ~2) is not met: passed=False.
+# Measured on THIS semi-discrete system at steady state, solved directly
+# (Newton on the cell-centred RHS; continuation 20->40->80->160->320, the
+# coarsest grid seeded by one transient march). Cell-centred finite volume:
+# N cells, each holding BOTH a gas and a liquid inventory, Dirichlet conditions
+# on the faces only.
+#   N      capture (%)   |rhs|inf   swing rel   alpha_b    alpha*(bottom)
+#   20     83.6499       3.8e-12    4.0e-13     0.431891   0.433223
+#   40     85.2033       7.6e-12    1.4e-14     0.436197   0.437690
+#   80     86.1747       3.1e-12    1.2e-11     0.438890   0.440559
+#   160    86.6784       3.4e-08    6.0e-10     0.440286   0.442237
+#   320    86.9024       8.7e-08    7.9e-11     0.440907   0.443174
+# Successive differences 1.553, 0.971, 0.504, 0.224 pp shrink monotonically
+# with observed order 0.68, 0.95, 1.17. Richardson on the finest pair (p=1.17)
+# gives 87.08 %. The 0.2 pp criterion is NOT met at N=320 (0.224 pp, 12 % over):
+# passed=False. At the observed ratio one more refinement reaches ~0.10 pp.
 #
-# What changed and what it settled: the liquid update is now the difference of
-# two reconstructed face fluxes, so summing it over the column telescopes
-# exactly (verified at every grid: n_MEA*(a_0 - a_{N-1/2}) equals
-# A*dz*sum_{i=0..N-2} rate_i to solver precision). Before, the second-order
-# one-sided derivative (-3a_i + 4a_{i+1} - a_{i+2})/(2dz) had no such identity and
-# the swing was 6.9 / 2.9 / <2 %. It is now 2.4 / 1.7 / 0.2 %.
+# Capture is insensitive to the root residual: at N=160 the solve leaves
+# |rhs| ~ 1e-8 while the closures are at 3e-11, and the capture changes by less
+# than 1e-6 pp against a run that converged a decade deeper. The error that
+# matters here is truncation, not the linear solve.
 #
-# Why the capture still does not converge: the liquid-side total,
-# n_MEA*(alpha_bottom - alpha_lean), reads 87.96 / 87.64 / 87.46 %, i.e. it
-# approaches a limit smoothly (0.32 then 0.18 pp, roughly first order), while
-# the gas side reads 85.88 / 86.19 / 87.59 %. The two agree only at N=80
-# (0.17 %); at N=20 the gas side is 2.4 % lower because node N-1 is a frozen
-# Dirichlet liquid inlet whose own absorption is counted by the gas balance and
-# never handed to the liquid inventory -- mass is destroyed in that half cell.
-# The absorption is confined to a ~2 m layer under the liquid inlet, which is
-# thinner than dz on the coarse grids, so that boundary error is O(1) there
-# rather than O(dz) and moves the outlet concentration most at N=20. Fixing it
-# needs the inlet node's flux booked into the liquid boundary condition (a
-# change to the boundary treatment, not to the advection stencil).
+# The mass closures are identities now, not metrics. Every cell owns both
+# inventories and both see the same rate_i*dz, so summing either phase gives
+#     A*dz*sum(rate_i) = u_G*A*(C_in - C_out) = n_MEA*(alpha_0 - alpha_lean)
+# to solver precision: swing 4e-13 ... 8e-11 and gas 4e-13 ... 3e-11 over the
+# five grids. The node grid could not do this -- it froze node 0 for the gas and
+# node N-1 for the liquid, so each phase skipped a DIFFERENT half cell, the two
+# integrals differed by A*dz*(rate_0 - rate_{N-1}), the swing read 2.4/1.7/0.2 %
+# and the capture order came out negative (-2.15).
+#
+# The converged answer is a pinch, not a coefficient: alpha_bottom sits at 99.5 %
+# of alpha_star at the bottom CO2 partial pressure, i.e. the solvent leaves at
+# equilibrium. Available swing 0.2432 mol CO2/mol MEA x 3.780 mol MEA/s = 0.919
+# mol/s, which is 87.7 % of the 1.048 mol/s fed -- so 90 % is unreachable at this
+# solvent rate and lean loading, whatever K_Ga or height is used. To reach 90 %:
+# m_solvent >= 0.790 kg/s (+2.6 %) or alpha_lean <= 0.194 (from 0.200).
+#
+# Why the observed order is ~1.2 and not 2: the increments do shrink consistently
+# (ratio 1.6, 1.9, 2.2) but the leading truncation term has not yet been isolated
+# term by term. The two first-order suspects are the zero-gradient outlet face
+# (the outflow value is taken as the cell value, not reconstructed) and minmod
+# clipping where the loading and temperature profiles turn over. Both are O(dz);
+# neither is a mass-conservation defect, which is why the closures above stay at
+# solver precision.
+#
+# Solver: steady state is solved directly (no time marching) with sparse Newton
+# on a coloured finite-difference Jacobian, continuation 20->40->80->160->320,
+# then a trust-region least-squares polish for the limiter kink. The Jacobian
+# pattern must be block PENTADIAGONAL: the minmod face value at f reads cells
+# f-2..f, so a tridiagonal pattern drops two-cell coupling and stalls Newton at
+# |rhs| ~ 5e-4 while still looking converged on coarse grids.
 GRID_STUDY = {
-    'capture_pct': {20: 85.8797, 40: 86.1949, 80: 87.5941},
-    'delta_20_40_pp': 0.3153,
-    'delta_40_80_pp': 1.3992,
-    'observed_order': -2.15,
+    'capture_pct': {20: 83.6499, 40: 85.2033, 80: 86.1747,
+                    160: 86.6784, 320: 86.9024},
+    'delta_pp': {20: 1.5534, 40: 0.9714, 80: 0.5037, 160: 0.2240},
+    'order': {20: 0.677, 40: 0.948, 80: 1.169},
+    'observed_order': 1.17,
+    'richardson_pct': 87.08,
     'criterion_pp': 0.2,
-    'loading_swing_rel': {20: 0.0242, 40: 0.0167, 80: 0.0017},
+    'loading_swing_rel': {20: 4.0e-13, 40: 1.4e-14, 80: 1.2e-11,
+                          160: 6.0e-10, 320: 7.9e-11},
     'passed': False,
 }
 
@@ -527,148 +549,139 @@ def _minmod(a, b):
     return (a if abs(a) < abs(b) else b)
 
 
-def gas_inlet_face(c0, c1, c2):
-    """Second-order value on the gas face half a cell above the inlet node.
+def _face_values_plus_z(u, inlet, n_cells):
+    """Face values of a phase flowing in +z on a cell-centred grid.
 
-    Node 0 is the Dirichlet gas inlet at z=0 and node 1 sits at dz, so the face
-    between them is at dz/2. Because node 0 is frozen there is no upstream cell
-    to form the two-point slope minmod(f_0-f_0, f_1-f_0); it is identically
-    zero, which is why the old closure was first-order upwind, f_1/2 = f_0.
-    Take the limited one-sided slope from the two forward differences instead:
+    Cell i occupies [i*dz, (i+1)*dz] and carries the unknown at its centre, so
+    N cells are bounded by N+1 faces at z = 0, dz, ..., H. Interior face f lies
+    between cells f-1 and f and is reconstructed from its UPSTREAM cell f-1:
 
-        s = minmod(f_1-f_0, f_2-f_1)/dz,    f_1/2 = f_0 + (dz/2) s
+        phi   = minmod(u_{f-1} - u_{f-2}, u_f - u_{f-1})
+        U_f   = u_{f-1} + 0.5*phi
 
-    For a smooth profile both forward differences equal f'dz + O(dz^2), so
-    f_1/2 = f(dz/2) + O(dz^2): second order. Exact for a linear profile, and it
-    falls back to f_0 where the limiter is active. The RHS and the removal
-    integral both call this, so the face value they see cannot drift apart.
+    For a linear profile u_f = u_{f-1} + 0.5*(u_f - u_{f-1}) = u(z_f) exactly,
+    and for a smooth one it is u(z_f) + O(dz^2); where the limiter clips it
+    falls back to first-order upwind. At f=1 the cell above the inlet face does
+    not exist, so the left difference uses the Dirichlet inlet value itself,
+    which is the same one-sided closure the node-based scheme used.
+
+    Boundary faces: inlet face 0 is the Dirichlet gas composition; outlet face
+    N is the zero-gradient convective outflow, u_{N-1}.
     """
-    return c0 + 0.5 * _minmod(c1 - c0, c2 - c1)
+    faces = np.empty(n_cells + 1)
+    faces[0] = inlet
+    for f in range(1, n_cells):
+        up = u[f - 1]
+        left = up - (u[f - 2] if f >= 2 else inlet)
+        right = u[f] - up
+        faces[f] = up + 0.5 * _minmod(left, right)
+    faces[n_cells] = u[n_cells - 1]
+    return faces
 
 
-def liquid_inlet_face(c_inlet, c1, c2):
-    """Second-order value on the liquid face just below the top inlet node.
+def _face_values_minus_z(u, inlet, n_cells):
+    """Face values of a phase flowing in -z (the liquid), same grid.
 
-    Mirror image of gas_inlet_face: the liquid inlet is node N-1 at z=H and the
-    face below it is at H-dz/2, so the one-sided limited slope is built from the
-    two backward differences (c1-c_inlet, c2-c1) and added to the inlet value.
+    The upstream cell of interior face f is cell f (the one above the face):
 
-        f_{N-1/2} = f_{N-1} + (dz/2) * minmod(f_{N-2}-f_{N-1}, f_{N-3}-f_{N-2})/dz
+        phi   = minmod(u_f - u_{f-1}, u_{f+1} - u_f)
+        U_f   = u_f - 0.5*phi
 
-    Same argument as the gas side: node N-1 is frozen, so the two-point slope
-    minmod(f_{N-1}-f_{N-1}, f_{N-2}-f_{N-1}) is identically zero and the closure
-    would be first-order upwind. For a smooth profile both backward differences
-    equal -f'dz + O(dz^2), giving f_{N-1/2} = f(H-dz/2) + O(dz^2).
+    At f = N-1 the cell above is the Dirichlet liquid inlet, so the second
+    difference uses the inlet value. Boundary faces: face N holds the lean
+    solvent loading; face 0 is the zero-gradient liquid outflow, u_0.
     """
-    return c_inlet + 0.5 * _minmod(c1 - c_inlet, c2 - c1)
+    faces = np.empty(n_cells + 1)
+    faces[n_cells] = inlet
+    for f in range(n_cells - 1, 0, -1):
+        up = u[f]
+        down = up - u[f - 1]
+        above = (u[f + 1] if f + 1 <= n_cells - 1 else inlet) - up
+        faces[f] = up - 0.5 * _minmod(down, above)
+    faces[0] = u[0]
+    return faces
 
 
 def mol_column_odes(t, state, n_zones=None, params=None):
     """Method-of-lines ODE system for the MEA absorption column.
-    
-    State vector: [C_G_CO2_node0, alpha_node0, T_gas_node0, T_liquid_node0,
-                   C_G_CO2_node1, alpha_node1, T_gas_node1, T_liquid_node1,
-                   ...]  -> total 3 * n_zones elements
-    
-    Key change from original: alpha (loading) replaces C_L_CO2 (total CO2).
-    No free dissolved CO2 state variable — closed algebraically via Hatta/enhancement.
-    State size 3*N_zones instead of 4*N_zones → stiffness ratio ~10² instead of 6.4×10⁵.
+
+    Discretisation: CELL-CENTRED finite volume.
+
+        cells   i = 0..N-1,  dz = H/N,  centres z_i = (i+0.5)*dz
+        faces   f = 0..N at z = f*dz  -- the boundary conditions live here only
+        gas     face z=0 : Dirichlet C_in, T_gas_in ;  face z=H : zero gradient
+        liquid  face z=H : Dirichlet alpha_lean, T_liquid_in ;  face z=0 : zero
+                gradient
+
+    State vector: [C_G_CO2_0, alpha_0, T_gas_0, T_liquid_0, C_G_CO2_1, ...],
+    4*N entries, every one of them a prognostic unknown.
+
+    Why cell-centred. The previous version put the unknowns on N nodes and made
+    node 0 (gas inlet) and node N-1 (liquid inlet) frozen Dirichlet values. Each
+    phase then owned a different set of active nodes -- the gas skipped node 0,
+    the liquid skipped node N-1 -- so the gas balance counted absorption in the
+    half cell below the liquid inlet that the liquid inventory never received,
+    while the liquid counted absorption above the gas inlet that the gas never
+    gave up. The two removal integrals differed by A*dz*(rate_0 - rate_{N-1}),
+    which is exactly the swing residual that would not close. With cells every
+    cell owns BOTH inventories and both see the same rate_vol_i*dz, so
+
+        A*dz*sum_{i=0..N-1} rate_i
+            == u_G*A*(C_in - C_{N-1})                    (gas-side drop)
+            == u_L*eps_L*A*C_MEA*(alpha_0 - alpha_lean)  (solvent swing)
+
+    at any N, to machine precision. That is an algebraic identity, not a
+    convergence property: what is left for the grid study to measure is pure
+    truncation error in the capture functional.
+
+    The removal is signed (absorbs where the gas is richer than the liquid
+    equilibrium, desorbs where it is not), so a stage sitting below the pinch
+    can relax instead of being clamped.
     """
     if params is None:
         params = {}
-    
-    # n_zones takes priority from parameter, fallback to N_ZONES module constant
-    if n_zones is not None:
-        N = int(n_zones)
-    else:
-        N = N_ZONES
-    
-    # Extract zone-specific parameters
-    u_G = params.get('u_G', UG_DEFAULT)       # gas velocity (m/s)
-    u_L = params.get('u_L', UL_DEFAULT)       # liquid velocity (m/s), counter-current
+
+    N = int(n_zones) if n_zones is not None else N_ZONES
+
+    u_G = params.get('u_G', UG_DEFAULT)         # superficial gas velocity, m/s
+    u_L = params.get('u_L', UL_DEFAULT)         # liquid velocity, m/s (falls -z)
     eps_G = params.get('eps_G', EPS_G_DEFAULT)  # gas holdup
     eps_L = params.get('eps_L', EPS_L_DEFAULT)  # liquid holdup
-    a_i = params.get('a_i', 250.0)            # interfacial area/vol (m²/m³)
-    UA = params.get('UA', 500.0)              # overall heat transfer coeff (W/m·K)
-    C_MEA = params.get('C_MEA', 3000.0)       # MEA concentration (mol/m³)
-    K_Ga = params.get('K_Ga', None)  # mol/(m3 s Pa), design-calibrated
-    
-    # Current state vector structure: 3 values per zone
-    # state = [C_G_CO2_0, alpha_0, T_gas_0, T_liquid_0, C_G_CO2_1, ...]
-    # NOTE: 3 variables per zone (no free C_L_CO2), so 3*N total
-    
-    # Validate state size — now 3 variables per zone
+    a_i = params.get('a_i', 250.0)              # interfacial area, m2/m3
+    UA = params.get('UA', 500.0)                # heat transfer, W/(m3 K)
+    C_MEA = params.get('C_MEA', 3000.0)         # mol MEA / m3 liquid
+    K_Ga = params.get('K_Ga', None)             # mol/(m3 s Pa)
+
     expected_size = 4 * N
     if len(state) != expected_size:
         raise ValueError(f"State vector size {len(state)} != expected {expected_size} "
-                         f"(3 variables × {N} zones; no free C_L_CO2)")
-    
-    # Reshape state into per-node arrays (4 per node: C_G, alpha, T_gas, T_liquid)
-    # (dead stride-3 block removed)
-    # Actually with 3 per zone: indices 0,1,2 then 3,4,5...
-    # Let me re-derive: state = [C_G_0, alpha_0, T_gas_0, C_G_1, alpha_1, T_gas_1, ...]
-    # That's 3 per zone, but the read above [0::3] gives C_G, [1::3] gives alpha, [2::3] gives T_gas
-    # And T_liquid would need a separate array or be part of the params
-    
-    # Let me restructure: with 3 vars/zone, we have C_G, alpha, T_gas per zone.
-    # T_liquid is computed from the energy balance below.
-    # But wait — the original had 4 vars/zone: C_G_CO2, C_L_CO2, T_gas, T_liquid.
-    # We're replacing C_L_CO2 with alpha, so we have: C_G_CO2, alpha, T_gas, T_liquid = 4 again.
-    # 
-    # Actually no — the whole point is that alpha REPLACES C_L_CO2 as the liquid variable,
-    # and T_liquid is still needed. So it IS 4 variables per zone still:
-    # [C_G_CO2, alpha, T_gas, T_liquid] → 4*N total, same as before.
-    # The difference is that alpha is loading (mol CO2 / mol MEA), not total mol/m³.
-    # And the two-film function uses alpha not C_L_CO2.
-    #
-    # BUT: can we reduce to 3? Only if we eliminate T_liquid somehow... no, we need it for energy.
-    # So it stays 4 variables per zone, but the second variable is alpha (loading) instead
-    # of C_L_CO2 (total CO2 concentration).
-    
-    # Let me just keep the original 4-per-zone structure but change what the second variable means.
-    # Actually, re-reading the code more carefully:
-    
-    # The state is [C_G_CO2_node0, C_L_CO2_node0, T_gas_node0, T_liquid_node0, ...]
-    # We want: [C_G_CO2_node0, alpha_node0, T_gas_node0, T_liquid_node0, ...]
-    # Same 4 per zone, just C_L_CO2 → alpha.
-    # 
-    # OK let me just do this properly. 4 variables per zone, second is alpha.
-    
-    # Hmm, but the search result said "3 * n_zones elements". Let me check if we can really do 3.
-    # 
-    # If we eliminate T_liquid by assuming it equals T_gas + approach, maybe. But that's an approximation.
-    # Better to keep 4 per zone but change variable meaning.
-    #
-    # Actually wait — let me re-examine. The original stiffness came from:
-    # reaction (3.4e-5 s) + gas zone (1.35 s) + liquid zone (21.6 s) + column (216 s)
-    # stiffness ratio ≈ 6.4×10⁵
-    # 
-    # If we keep T_liquid and just change C_L_CO2 → alpha, the reaction time scale
-    # is still there unless we also close the free CO2 algebraically IN the ODE function.
-    # 
-    # The real fix is: in the ODE function, don't carry free C_CO2 as a state.
-    # Use alpha only, and compute mass transfer flux via the loading-based two-film.
-    # The "stiffness removal" comes from not having dC_CO2_dt in the state vector.
-    # 
-    # So: state = [C_G_CO2_0, alpha_0, T_gas_0, T_liquid_0, C_G_CO2_1, alpha_1, T_gas_1, T_liquid_1, ...]
-    # That's 4 * N elements, same as before. The difference: variable 2 is alpha, not C_L_CO2.
-    # The ODE for alpha is not d(alpha)/dt from reactions — it's updated via the
-    # mass transfer flux. No fast free-CO2 differential equation.
-    #
-    # Let me just implement this cleanly.
-    
-    # === Redefine: 4 variables per zone, variable 2 = alpha (loading) ===
-    
-    # Reshape state into per-node arrays (4 per zone)
-    # state layout: [C_G_0, alpha_0, T_gas_0, T_liquid_0, C_G_1, alpha_1, T_gas_1, T_liquid_1, ...]
-    C_G_CO2 = state[0::4]      # gas CO2 at each node (length N)
-    alpha = state[1::4]        # liquid loading at each node (length N) — mol CO2 / mol MEA
-    T_gas = state[2::4]        # gas temp at each node (length N)
-    T_liquid = state[3::4]     # liquid temp at each node (length N)
-    
-    # Spatial step size
-    dz = COLUMN_HEIGHT / (N - 1) if N > 1 else COLUMN_HEIGHT
-    
+                         f"(4 variables x {N} cells)")
+
+    C_G_CO2 = state[0::4]      # gas CO2, mol per m3 of GAS
+    alpha = state[1::4]        # liquid loading, mol CO2 / mol MEA
+    T_gas = state[2::4]        # C
+    T_liquid = state[3::4]     # C
+
+    # N cells span the column, so dz = H/N. The node grid used H/(N-1) over
+    # nodes 0..N-1, which integrated 33.3 m of a 30 m column whenever the
+    # removal integral was summed with uniform weights.
+    dz = COLUMN_HEIGHT / N
+
+    # Boundary data, taken from the same parameter dict the transient path and
+    # the steady solver both use, so the three routes to the fixed point agree.
+    C_G_inlet = params.get('C_G_CO2_inlet', 8.0)
+    T_gas_inlet = params.get('T_gas_inlet', T_INLET)
+    alpha_lean = params.get('alpha_lean', 0.20)
+    T_liquid_inlet = params.get('T_liquid_inlet', 40.0)
+
+    # Face values, once per evaluation. Each face is reconstructed from the cell
+    # upstream of it, so it has exactly one value: the flux cell i loses is the
+    # flux cell i-1 gains, and the column sums telescope.
+    faceG_C = _face_values_plus_z(C_G_CO2, C_G_inlet, N)
+    faceG_T = _face_values_plus_z(T_gas, T_gas_inlet, N)
+    faceL_a = _face_values_minus_z(alpha, alpha_lean, N)
+    faceL_T = _face_values_minus_z(T_liquid, T_liquid_inlet, N)
+
     # Pre-allocate derivatives
     dC_G_CO2_dt = np.zeros(N)
     dalpha_dt = np.zeros(N)
@@ -780,152 +793,30 @@ def mol_column_odes(t, state, n_zones=None, params=None):
         
         source_T_liquid = (-dQ / (RHO_L * CP_L * eps_L) + desorption_term) if eps_L > 0 else 0.0
         
-        # --- 5. Convection (first-order upwind, flow directions respected) ---
-        # Gas rises (+z) so it takes information from i-1; liquid falls (-z)
-        # so it takes information from i+1. The old central differences with a
-        # single sign let rich loading accumulate at the bottom without outflow,
-        # driving alpha past saturation.
-        if i == 0:
-            # gas inlet (Dirichlet): held at the inlet condition
-            conv_G = 0.0
-            conv_T_gas = 0.0
-            gas_inlet = True
-        else:
-            # Conservative MUSCL (minmod) reconstruction for gas-phase advection.
-            # First-order upwind is recovered when the limiter is zero.
-            # Face value:  f_{i+1/2} = f_i + (dz/2)*s_i,  s_i = minmod(dL,dR)/dz,
-            # i.e. the limited slope is added once, in concentration units. The
-            # previous code multiplied the limiter by dR as well, which made the
-            # reconstruction error O(dz^2) locally and first order globally.
-            # right face of cell i (i/i+1)
-            if i < N - 1:
-                dR = C_G_CO2[i+1] - C_G_CO2[i]
-                dL = C_G_CO2[i] - (C_G_CO2[i-1] if i > 0 else C_G_CO2[i])
-                phi = _minmod(dL, dR)
-                faceR_C = C_G_CO2[i] + 0.5*phi
-                dR = T_gas[i+1] - T_gas[i]
-                dL = T_gas[i] - (T_gas[i-1] if i > 0 else T_gas[i])
-                phi = _minmod(dL, dR)
-                faceR_T = T_gas[i] + 0.5*phi
-            else:
-                faceR_C = C_G_CO2[i]
-                faceR_T = T_gas[i]
-            # left face of cell i (i-1/i), i.e. the right face of cell j=i-1
-            j = i - 1
-            if j == 0:
-                # Inlet-adjacent face, second order.
-                # Node 0 is the Dirichlet gas inlet, so cell 0 has no upstream
-                # neighbour: the two-point slope minmod(f_0-f_0, f_1-f_0) is
-                # identically zero and the old closure fell back to first-order
-                # upwind, f_{1/2} = f_0. Build the slope from the two forward
-                # differences instead:
-                #     s = minmod(d1, d2)/dz,  d1 = f_1-f_0,  d2 = f_2-f_1
-                #     f_{1/2} = f_0 + (dz/2) s
-                # For a smooth profile d1 = f'dz + O(dz^2) and d2 = f'dz +
-                # O(dz^2), so s = f'(z_{1/2}) + O(dz^2) and f_{1/2} is second
-                # order. Where the data is not monotone the limiter returns 0 and
-                # the closure drops to first order, exactly as in the interior.
-                if N > 2:
-                    faceL_C = gas_inlet_face(C_G_CO2[0], C_G_CO2[1], C_G_CO2[2])
-                    faceL_T = gas_inlet_face(T_gas[0], T_gas[1], T_gas[2])
-                else:
-                    faceL_C = C_G_CO2[0]
-                    faceL_T = T_gas[0]
-            else:
-                dR = C_G_CO2[i] - C_G_CO2[j]
-                dL = C_G_CO2[j] - C_G_CO2[j-1]
-                phi = _minmod(dL, dR)
-                faceL_C = C_G_CO2[j] + 0.5*phi
-                dR = T_gas[i] - T_gas[j]
-                dL = T_gas[j] - T_gas[j-1]
-                phi = _minmod(dL, dR)
-                faceL_T = T_gas[j] + 0.5*phi
-            conv_G = (faceR_C - faceL_C) / dz
-            conv_T_gas = (faceR_T - faceL_T) / dz
-            gas_inlet = False
-
-        if i == N - 1:
-            # liquid inlet at the top (Dirichlet): held at lean solvent
-            conv_alpha = 0.0
-            conv_T_liquid = 0.0
-            liquid_inlet = True
-        else:
-            # Conservative face-flux form, same construction as the gas side.
-            # The liquid falls in -z, so cell i is fed through its RIGHT face
-            # (at z_{i+1/2}) by node i+1 and discharges through its LEFT face
-            # (at z_{i-1/2}) toward node i-1. Accumulation is the difference of
-            # those two face fluxes over dz, never a one-sided derivative:
-            #
-            #     d(alpha_i)/dt = u_L * (a_{i+1/2} - a_{i-1/2}) / dz
-            #
-            # The previous form (-3a_i + 4a_{i+1} - a_{i+2})/(2dz) is a
-            # second-order *pointwise* approximation of d(alpha)/dz but it is
-            # not a flux difference: summing it over the column does not
-            # telescope, so the discrete liquid inventory had no consistent
-            # inflow/outflow pair and the loading swing could not close.
-            #
-            # Each face is reconstructed from its upstream node with the same
-            # limited slope, evaluated at the face:
-            #     a_{i+1/2} = a_{i+1} - 0.5*minmod(a_{i+1}-a_i, a_{i+2}-a_{i+1})
-            #     a_{i-1/2} = a_i     - 0.5*minmod(a_i-a_{i-1}, a_{i+1}-a_i)
-            # Both are a(x_face) + O(dz^2) for a smooth profile and reduce to
-            # first-order upwind (a_{i+1} and a_i) where the limiter clips.
-            #
-            # Boundaries: the face just below the Dirichlet inlet sits at
-            # H-dz/2 and uses the one-sided inlet closure; the bottom outlet
-            # face takes the zero-gradient value a_0, which is the same outflow
-            # convention the gas outlet face uses (faceR = C_G[N-1]).
-            if i == N - 2:
-                if N > 2:
-                    faceR_a = liquid_inlet_face(alpha[N-1], alpha[N-2], alpha[N-3])
-                    faceR_T = liquid_inlet_face(T_liquid[N-1], T_liquid[N-2], T_liquid[N-3])
-                else:
-                    faceR_a = alpha[N-1]
-                    faceR_T = T_liquid[N-1]
-            else:
-                phi = _minmod(alpha[i+1] - alpha[i], alpha[i+2] - alpha[i+1])
-                faceR_a = alpha[i+1] - 0.5*phi
-                phi = _minmod(T_liquid[i+1] - T_liquid[i], T_liquid[i+2] - T_liquid[i+1])
-                faceR_T = T_liquid[i+1] - 0.5*phi
-            if i == 0:
-                faceL_a = alpha[0]
-                faceL_T = T_liquid[0]
-            else:
-                phi = _minmod(alpha[i] - alpha[i-1], alpha[i+1] - alpha[i])
-                faceL_a = alpha[i] - 0.5*phi
-                phi = _minmod(T_liquid[i] - T_liquid[i-1], T_liquid[i+1] - T_liquid[i])
-                faceL_T = T_liquid[i] - 0.5*phi
-            conv_alpha = (faceR_a - faceL_a) / dz
-            conv_T_liquid = (faceR_T - faceL_T) / dz
-            liquid_inlet = False
-
+        # --- 5. Conservative face fluxes --------------------------------------
+        # Gas rises (+z): fed through face i, discharges through face i+1.
+        # Liquid falls (-z): fed through face i+1, discharges through face i.
+        # Both are differences of the SAME shared face arrays, which is what
+        # makes the column-integrated balances telescope.
+        conv_G = -(faceG_C[i + 1] - faceG_C[i]) / dz
+        conv_T_gas = -(faceG_T[i + 1] - faceG_T[i]) / dz
+        conv_alpha = (faceL_a[i + 1] - faceL_a[i]) / dz
+        conv_T_liquid = (faceL_T[i + 1] - faceL_T[i]) / dz
 
         # --- 6. Compute final derivatives ---
-        
-        # Gas phase CO2: convection + mass transfer source
-        # Source: - (a_i / eps_G) * N_CO2  (mol/m³/s from gas perspective, leaving gas)
-        # C_G is per unit GAS volume, so both the convective transport and the
-        # source must be converted with eps_G (the old code divided only the
-        # source, which made the gas balance and the removal integral differ by
-        # exactly 1/eps_G and could never close).
-        # C_G is per unit GAS volume, so the whole balance (transport and sink)
-        # is divided by eps_G. Dividing only the sink left the removal integral
-        # (per column volume) low by exactly eps_G.
+        # C_G is mol per m3 of GAS, so the whole gas cell balance (advection and
+        # sink) is divided by eps_G; dividing only the sink left the removal
+        # integral low by exactly eps_G. Every cell is prognostic here -- there
+        # are no frozen inlet nodes left to skip.
         source_G = -rate_vol
-        
-        # Liquid phase loading: convection + mass transfer source
-        # No reaction dterm in differential state (stiffness removal)
-        source_alpha = dalpha_source  # from mass transfer only
-        
-        # Inlet nodes are Dirichlet: the state there is the boundary value.
-        dC_G_CO2_dt[i] = 0.0 if gas_inlet else (
-            (-u_G * conv_G + source_G) / eps_G if eps_G > 0
-            else (-u_G * conv_G + source_G))
-        dT_gas_dt[i] = 0.0 if gas_inlet else (-u_G * conv_T_gas + source_T_gas)
-        dalpha_dt[i] = 0.0 if liquid_inlet else (u_L * conv_alpha + source_alpha)
-        dT_liquid_dt[i] = 0.0 if liquid_inlet else (
-            u_L * conv_T_liquid + source_T_liquid)
-    
+        source_alpha = dalpha_source
+
+        dC_G_CO2_dt[i] = ((u_G * conv_G + source_G) / eps_G if eps_G > 0
+                          else (u_G * conv_G + source_G))
+        dT_gas_dt[i] = u_G * conv_T_gas + source_T_gas
+        dalpha_dt[i] = u_L * conv_alpha + source_alpha
+        dT_liquid_dt[i] = u_L * conv_T_liquid + source_T_liquid
+
     # Return concatenated derivatives (same order as state vector)
     # MUST match the state layout [C_G, alpha, T_gas, T_liquid] per node.
     # np.concatenate([...]) produced a block-ordered vector (all C_G, then all
@@ -968,7 +859,9 @@ def set_initial_conditions(n_zones=N_ZONES,
     N = n_zones
     state = []
     for i in range(N):
-        frac = i / (N - 1) if N > 1 else 1.0
+        # Cell centres, not nodes: (i+0.5)/N is the fractional height of cell i
+        # on the cell-centred grid.
+        frac = (i + 0.5) / N
         C_G_CO2 = C_G_CO2_inlet                      # flat: no seeded removal
         alpha = alpha_rich + (alpha_lean - alpha_rich) * frac  # rich bottom
         T_gas = T_gas_inlet + 5.0 * frac
@@ -1007,29 +900,19 @@ def set_boundary_conditions(params):
 # Column Simulation (MOL-Based)
 # ============================================================================
 
-def simulate_column_mol(
-    duration=300.0,
-    dt=1.0,
-    n_zones=N_ZONES,
-    disturbance=None,
-    disturbance_magnitude=0.2,
-    **params
-):
-    """Simulate MEA column using Method of Lines PDE discretization.
-    
-    Key improvements over original:
-    - alpha (loading) replaces C_L_CO2 (total CO2 concentration) — no unit mismatch
-    - Two-film uses Formulation B: loading-based, no free CO2 state
-    - Stiffness removed: no free dissolved CO2 differential state
-    - Enhancement factor closed algebraically
+def build_column_params(n_zones=N_ZONES, **params):
+    """Derive the full RHS parameter set from design_basis.yaml.
+
+    Extracted from simulate_column_mol so the transient integrator and the
+    steady-state Newton solver cannot drift apart: one derivation, one set of
+    velocities, holdup and K_Ga. Geometry, holdup, liquid velocity and the
+    gas-side coefficient are all derived, never declared twice.
+
+    Returns (cfg, rhs_params). cfg carries the derived scalars; rhs_params is
+    exactly what mol_column_odes expects.
     """
     global COLUMN_DIAMETER, COLUMN_HEIGHT
 
-    if duration <= 0:
-        raise ValueError(f"duration must be > 0 s (got {duration})")
-
-    N = n_zones
-    
     # Default parameters
     default_params = {
         'u_G': params.get('u_G', UG_DEFAULT),
@@ -1039,7 +922,7 @@ def simulate_column_mol(
         'a_i': params.get('a_i', 250.0),
         'UA': params.get('UA', 500.0),
         'C_MEA': params.get('C_MEA', 3000.0),
-        'n_zones': N,
+        'n_zones': n_zones,
         'T_gas_inlet': params.get('T_gas_inlet', T_INLET),
         'T_liquid_inlet': params.get('T_liquid_inlet', 40.0),
         'C_G_CO2_inlet': params.get('C_G_CO2_inlet', 8.0),
@@ -1146,6 +1029,55 @@ def simulate_column_mol(
     UA_reboiler, T_ambient = cfg['UA'], cfg['T_amb']
     UA_source = 'design_basis.yaml' if 'UA_reboiler_W_per_K' in db else 'fallback_default'
     m_solvent = cfg['m_solvent']
+    cfg.update({
+        'u_G': u_G,
+        'u_L': u_L,
+        'K_Ga': K_Ga,
+        'NTU': NTU,
+        'HTU': HTU,
+        'A_cs_m2': A_cs,
+        'C_MEA': cfg['C_MEA'],
+        'C_G_in': cfg['C_G_in'],
+        'kg_a_basis': kg_a_basis,
+        'UA_source': UA_source,
+        'eps_L': cfg['eps_L'],
+        'eps_G': default_params['eps_G'],
+    })
+    return cfg, default_params
+
+
+def simulate_column_mol(
+    duration=300.0,
+    dt=1.0,
+    n_zones=N_ZONES,
+    disturbance=None,
+    disturbance_magnitude=0.2,
+    **params
+):
+    """Simulate MEA column using Method of Lines PDE discretization.
+    
+    Key improvements over original:
+    - alpha (loading) replaces C_L_CO2 (total CO2 concentration) — no unit mismatch
+    - Two-film uses Formulation B: loading-based, no free CO2 state
+    - Stiffness removed: no free dissolved CO2 differential state
+    - Enhancement factor closed algebraically
+    """
+    global COLUMN_DIAMETER, COLUMN_HEIGHT
+
+    if duration <= 0:
+        raise ValueError(f"duration must be > 0 s (got {duration})")
+
+    N = n_zones
+    
+    cfg, default_params = build_column_params(N, **params)
+    COLUMN_DIAMETER, COLUMN_HEIGHT = cfg['D'], cfg['H']
+    u_G, u_L, K_Ga = cfg['u_G'], cfg['u_L'], cfg['K_Ga']
+    A_cs, NTU, HTU = cfg['A_cs_m2'], cfg['NTU'], cfg['HTU']
+    kg_a_basis = cfg['kg_a_basis']
+    UA_reboiler, T_ambient = cfg['UA'], cfg['T_amb']
+    UA_source = cfg['UA_source']
+    m_solvent = cfg['m_solvent']
+
     
     # Apply disturbance
     t_disturbance = 60.0  # seconds into simulation (after startup)
@@ -1232,7 +1164,8 @@ def simulate_column_mol(
     results['alpha'] = alpha_history.T        # (n_points, N) — loading
     results['T_gas'] = T_gas_history.T
     results['T_liquid'] = T_liquid_history.T
-    results['z_positions'] = np.linspace(0, COLUMN_HEIGHT, N)
+    # Cell centres, not nodes: cell i sits at (i+0.5)*dz.
+    results['z_positions'] = (np.arange(N) + 0.5) * (COLUMN_HEIGHT / N)
     
     # Calculate derived quantities per time step
     C_G_inlet = default_params.get('C_G_CO2_inlet', 8.0)
@@ -1253,24 +1186,18 @@ def simulate_column_mol(
     w0 = int(0.8 * n_pts) if n_pts >= 5 else 0
 
     # CO2 removal from the zone flux integral (not an inlet/outlet guess).
-    dz_node = COLUMN_HEIGHT / (N - 1) if N > 1 else COLUMN_HEIGHT
+    dz_cell = COLUMN_HEIGHT / N
     A_cs_col = np.pi * (COLUMN_DIAMETER / 2.0) ** 2
-    # Weights follow the discrete gas balance exactly. Summing the upwind
-    # gas equation over nodes 1..N-1 at steady state cancels the interior
-    # fluxes and leaves u_G*A*(C_in - C_out) = A*dz*sum_{i>=1} rate_vol_i.
-    # So the inlet node carries zero weight and every other node one dz
-    # (N-1 cells = H). A trapezoid halves the inlet and biases the integral
-    # high; uniform dz integrates 33.3 m of a 30 m column (+11 %).
-    # The velocity the RHS actually ran with: a gas_velocity disturbance scales
-    # u_G after t_disturbance. Reporting the base velocity here (while the
-    # solver used base*(1+magnitude)) biased the gas-side removal by exactly
-    # that factor -- the unexplained 20 % / 2 % residual.
+    # Every cell carries the same weight dz and there are N of them, so the sum
+    # covers exactly H. Summing the gas cell balances at steady state cancels
+    # the interior face fluxes and leaves
+    #     u_G*A*(C_in - C_out) = A*dz*sum_{i=0..N-1} rate_i,
+    # with no half-cell bookkeeping: the boundary conditions are face values,
+    # not frozen unknowns, so no node's absorption falls outside the sum.
     u_G_applied = u_G
     if disturbance == 'gas_velocity' and duration >= t_disturbance:
         u_G_applied = u_G * (1.0 + disturbance_magnitude)
 
-    w_node = np.ones(N)
-    w_node[0] = 0.0
     n_CO2_series = np.zeros(n_pts)
     for k in range(n_pts):
         acc = 0.0
@@ -1280,21 +1207,7 @@ def simulate_column_mol(
             P_star = equilibrium_liquid_co2_loading(results['alpha'][k, i], T_avg)
             # Same signed flux as the RHS, so absorption and desorption both
             # count and the integral still satisfies the gas-side identity.
-            acc += w_node[i] * K_Ga * (P_G - P_star) * A_cs_col * dz_node
-        # The inlet node is frozen (Dirichlet), so the flux it hands to node 1
-        # is the reconstructed face value, not C_in. Its absorption between
-        # z=0 and dz/2 is therefore real duty that the zero weight on node 0
-        # would otherwise drop, and the gas-side identity
-        #   u*(C_in - C_out) = sum_{i>=1} rate_i*dz + u*(C_in - f_1/2)
-        # would not close (that is the 1.75 % residual the second-order inlet
-        # face produced at N=40). Counting it makes the two sides comparable.
-        if N > 2:
-            face_in = gas_inlet_face(results['C_G_CO2'][k, 0],
-                                     results['C_G_CO2'][k, 1],
-                                     results['C_G_CO2'][k, 2])
-        else:
-            face_in = results['C_G_CO2'][k, 0]
-        acc += u_G_applied * A_cs_col * (C_G_inlet - face_in)
+            acc += K_Ga * (P_G - P_star) * A_cs_col * dz_cell
         n_CO2_series[k] = acc
 
     n_CO2_avg = float(np.mean(n_CO2_series[w0:]))
@@ -1350,7 +1263,10 @@ def simulate_column_mol(
         T_liquid_reb=cfg['T_reb'],
         m_solvent=cfg['m_solvent'],
         alpha_rich=float(np.mean(results['alpha'][w0:, 0])),
-        alpha_lean=float(np.mean(results['alpha'][w0:, -1])),
+        # The solvent ENTERS at alpha_lean (Dirichlet top face); the top
+        # cell sits above that and has already absorbed a little, so using
+        # its mean here made the swing identity miss by the top-cell flux.
+        alpha_lean=cfg['alpha_lean'],
         UA_reboiler_W_K=UA_reboiler,
         w_MEA=cfg['w_MEA'],
         capture_target_pct=cfg['capture_target'] * 100.0,
@@ -1420,6 +1336,252 @@ def simulate_column_mol(
 
     return times, results
     
+
+
+# ============================================================================
+# Steady state: Newton on the same RHS the transient integrator marches
+# ============================================================================
+
+def alpha_at_equilibrium(P_CO2_Pa, T_C):
+    """Loading in equilibrium with a CO2 partial pressure.
+
+    Inverts the VLE the RHS uses, P_star = H(T)*alpha/(1 - alpha/0.5), so
+        alpha = P / (H + 2P).
+    Asking whether the rich end can physically reach a loading at all is a
+    design question (solvent rate, lean loading), not a numerical one.
+    """
+    H = henry_constant_Pa_m3_mol(T_C)
+    return P_CO2_Pa / (H + 2.0 * P_CO2_Pa)
+
+
+def solve_steady_state(n_zones=N_ZONES, y0=None, tol=1e-11,
+                       maxiter=40, **params):
+    """Solve the steady cell balances directly, instead of time-marching.
+
+    The fixed point is a root of the same RHS the transient path integrates, so
+    both routes solve the same equations; only the path differs. Newton with a
+    Krylov Jacobian needs no sparsity pattern and converges from an
+    interpolated coarse-grid profile in a handful of iterations, which turns the
+    N=80 case (~690 s of marching) into seconds and makes N=160/320 practical.
+
+    Returns (y, residual_inf_norm, cfg, rhs_params).
+    """
+    from scipy.optimize import root
+
+    N = int(n_zones)
+    cfg, rhs_params = build_column_params(N, **params)
+    if y0 is None:
+        y0 = set_initial_conditions(
+            n_zones=N, **{k: v for k, v in rhs_params.items() if k != 'n_zones'})
+    y = np.asarray(y0, dtype=float).ravel()
+
+    if len(y) != 4 * N:
+        raise ValueError(f"initial guess has {len(y)} entries, expected {4 * N}")
+
+    rhs = lambda v: mol_column_odes(0.0, v, N, rhs_params)
+
+    # leave y inside the domain where the strict RHS is defined (alpha >=
+    # alpha_max diverges the VLE and raises) before handing it to the solver.
+    y = np.array(y, dtype=float, copy=True)
+    y[0::4] = np.maximum(y[0::4], 1e-12)          # gas CO2 concentration
+    y[1::4] = np.clip(y[1::4], 1e-6, 0.498)       # loading, below saturation
+    y[2::4] = np.maximum(y[2::4], 0.0)            # gas temperature, C
+    y[3::4] = np.maximum(y[3::4], 0.0)            # liquid temperature, C
+
+    def _project(v):
+        w = np.array(v, dtype=float, copy=True)
+        w[0::4] = np.maximum(w[0::4], 1e-12)
+        w[1::4] = np.clip(w[1::4], 1e-6, 0.498)
+        w[2::4] = np.maximum(w[2::4], 0.0)
+        w[3::4] = np.maximum(w[3::4], 0.0)
+        return w
+
+    # --- Jacobian sparsity ------------------------------------------------
+    # Cell i's balance reads faces i and i+1. A MUSCL face value at f is built
+    # from cells f-2, f-1, f (gas, upstream-biased), so the gas part couples
+    # cell i to i-2..i+1; the liquid face at f+1 is built from f, f+1, f+2, so
+    # cell i couples to i-1..i+2. The pattern is therefore block pentadiagonal
+    # (i-2..i+2), NOT tridiagonal: a tridiagonal pattern silently drops the
+    # limiter's two-cell coupling, and Newton then stalls at |rhs|~5e-4 on
+    # N=160 while looking converged at N=80. Colouring the correct pattern
+    # still forms the full Jacobian from ~17 residual evaluations.
+    from scipy.optimize._numdiff import group_columns
+    from scipy.sparse import lil_matrix
+    from scipy.sparse.linalg import spsolve
+
+    sp = lil_matrix((4 * N, 4 * N), dtype=int)
+    for i in range(N):
+        sp[4 * i:4 * i + 4, 4 * max(i - 2, 0):4 * min(i + 2, N - 1) + 4] = 1
+    sp = sp.tocsr()
+    groups = group_columns(sp)
+    rows_of = [sp.indices[sp.indptr[j]:sp.indptr[j + 1]] for j in range(4 * N)]
+    unique_groups = np.unique(groups)
+
+    y = _project(y)
+    f = rhs(y)
+    res = float(np.max(np.abs(f)))
+
+    # Damped Newton on the sparse Jacobian. The projection is applied to
+    # iterates only; the returned profile is checked against the strict RHS, so
+    # a solution that needs projecting is reported rather than hidden.
+    for _ in range(maxiter):
+        if res < tol:
+            break
+        J = lil_matrix((4 * N, 4 * N), dtype=float)
+        step_ok = True
+        for g in unique_groups:
+            cols = np.where(groups == g)[0]
+            h = {int(j): 1e-7 * max(abs(y[j]), 1e-4) for j in cols}
+            yp = y.copy()
+            for j in cols:
+                yp[j] += h[int(j)]
+            try:
+                fp = rhs(yp)
+            except ValueError:
+                step_ok = False
+                break
+            dfp = fp - f
+            for j in cols:
+                jj = int(j)
+                rows = rows_of[jj]
+                J[rows, jj] = dfp[rows] / h[jj]
+        if not step_ok:
+            break
+
+        try:
+            dy = spsolve(J.tocsr(), -f)
+        except Exception:
+            break
+        if not np.all(np.isfinite(dy)):
+            break
+
+        lam, accepted = 1.0, False
+        for _ in range(12):
+            try:
+                yn = _project(y + lam * dy)
+                fn = rhs(yn)
+            except ValueError:
+                lam *= 0.5
+                continue
+            if np.max(np.abs(fn)) < np.max(np.abs(f)):
+                accepted = True
+                break
+            lam *= 0.5
+        if not accepted:
+            break
+        y, f = yn, fn
+        res = float(np.max(np.abs(f)))
+
+    res_best = res
+    if not np.isfinite(res_best) or res_best > 1e-8:
+        # Last resort: Krylov-Newton restarts from the best iterate.
+        fun = lambda v: mol_column_odes(0.0, _project(v), N, rhs_params)
+        y_best = y
+        for _ in range(4):
+            sol = root(fun, y_best, method='krylov',
+                       options={'fatol': tol, 'xatol': tol, 'maxiter': 400})
+            cand = np.asarray(sol.x, dtype=float)
+            if not np.all(np.isfinite(cand)):
+                break
+            try:
+                res_cand = float(np.max(np.abs(rhs(cand))))
+            except ValueError:
+                res_cand = float('inf')
+            if res_cand < res_best:
+                y_best, res_best = cand, res_cand
+            if res_best < 1e-11:
+                break
+        y = y_best
+
+    if not np.isfinite(res_best) or res_best > 1e-11:
+        # Polish. Minmod is a limiter: wherever a slope changes sign the residual
+        # is only piecewise smooth, so a Newton line search can stall several
+        # decades above machine precision even with an isolated root. A
+        # trust-region least-squares step tolerates the kink better, and started
+        # from an already-good iterate it costs a handful of evaluations. Bounds
+        # keep it inside the domain where the strict RHS is defined.
+        from scipy.optimize import least_squares
+        from scipy.sparse import lil_matrix
+
+        sp = lil_matrix((4 * N, 4 * N), dtype=int)
+        for i in range(N):
+            sp[4 * i:4 * i + 4, 4 * max(i - 2, 0):4 * min(i + 2, N - 1) + 4] = 1
+        lo = np.full(4 * N, -np.inf)
+        hi = np.full(4 * N, np.inf)
+        lo[0::4], hi[0::4] = 0.0, np.inf
+        lo[1::4], hi[1::4] = 1e-8, 0.4999
+        lo[2::4], hi[2::4] = -50.0, 400.0
+        lo[3::4], hi[3::4] = -50.0, 400.0
+        try:
+            solp = least_squares(rhs, y, bounds=(lo, hi),
+                                 jac_sparsity=sp.tocsr(), method='trf',
+                                 xtol=1e-15, ftol=1e-15, gtol=1e-15,
+                                 max_nfev=120)
+            yp = np.asarray(solp.x, dtype=float)
+            resp = float(np.max(np.abs(rhs(yp))))
+            if resp < res_best:
+                y, res_best = yp, resp
+        except Exception:
+            pass
+
+    return y, res_best, cfg, rhs_params
+
+
+def steady_state_report(y, n_zones, cfg, rhs_params):
+    """Observables of a converged profile, with both independent mass closures.
+
+    n_flux is the cell integral A*dz*sum(rate_i); n_gas and n_liq are the two
+    ways the column as a whole can be read. At a true steady state of this
+    discretisation all three are the same number to machine precision, so
+    swing_rel is a code-correctness assertion. If it is not ~1e-12 the
+    discretisation is leaking, not converging.
+    """
+    N = int(n_zones)
+    y = np.asarray(y, dtype=float).ravel()
+    C_G = y[0::4]
+    alpha = y[1::4]
+    T_g = y[2::4]
+    T_l = y[3::4]
+    dz = cfg['H'] / N
+    A = cfg['A_cs_m2']
+
+    n_flux = 0.0
+    for i in range(N):
+        T_avg = 0.5 * (T_g[i] + T_l[i])
+        P_G = C_G[i] * 8.314 * (T_avg + 273.15)
+        P_star = equilibrium_liquid_co2_loading(alpha[i], T_avg)
+        n_flux += cfg['K_Ga'] * (P_G - P_star) * A * dz
+
+    C_in = cfg['C_G_in']
+    n_gas = cfg['u_G'] * A * (C_in - C_G[N - 1])
+    n_MEA = cfg['u_L'] * cfg['eps_L'] * A * cfg['C_MEA']
+    alpha_lean = rhs_params['alpha_lean']
+    n_liq = n_MEA * (alpha[0] - alpha_lean)
+
+    T_bottom = 0.5 * (T_g[0] + T_l[0])
+    P_G_bottom = C_G[0] * 8.314 * (T_bottom + 273.15)
+    a_star = alpha_at_equilibrium(P_G_bottom, T_bottom)
+
+    return {
+        'capture_pct': 100.0 * (1.0 - C_G[N - 1] / C_in),
+        'n_flux': n_flux,
+        'n_gas': n_gas,
+        'n_liq': n_liq,
+        'n_gas_rel': abs(n_gas - n_flux) / abs(n_flux),
+        'swing_rel': abs(n_liq - n_flux) / abs(n_flux),
+        'alpha_bottom': float(alpha[0]),
+        'alpha_top': float(alpha[N - 1]),
+        'alpha_lean': float(alpha_lean),
+        'n_MEA': n_MEA,
+        'alpha_star_bottom': a_star,
+        'P_CO2_bottom': P_G_bottom,
+        'T_bottom': T_bottom,
+        'C_G_out': float(C_G[N - 1]),
+        'C_G_bottom': float(C_G[0]),
+        'alpha_max_used': float(np.max(alpha)),
+        'T_gas_span': (float(T_g[0]), float(T_g[N - 1])),
+        'T_liq_span': (float(T_l[0]), float(T_l[N - 1])),
+    }
 
 
 # ============================================================================
